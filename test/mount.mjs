@@ -23,6 +23,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync 
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { boot, loadOptionalPatches } from '@deepseek-ai/dsh-app-boot'
+import { PANEL_PATH } from '../lib/panel.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const pluginDir = resolve(here, '..')
@@ -89,6 +90,18 @@ writeFileSync(join(profileDir, 'cordis.patch.yml'), `# The host rows this plugin
     - id: tools
       name: '@deepseek-ai/dsh-tools'
 
+    - id: webserver
+      name: '@deepseek-ai/dsh-host-webserver'
+      config:
+        host: 127.0.0.1
+        port: 0
+
+    - id: connection
+      name: '@deepseek-ai/dsh-client-connection'
+
+    - id: client-modules
+      name: '@deepseek-ai/dsh-client-modules'
+
     - id: cline-pass
       name: ${JSON.stringify(join(pluginDir, 'lib/index.js'))}
       config:
@@ -132,6 +145,12 @@ try {
   // surface here as INVALID_MODEL_REASONING rather than in the picker.
   const resolvedFlash = await llm.resolveModelInfo('cline-pass', 'cline-pass/deepseek-v4.1-flash')
   check('the real seam accepts the published context window', resolvedFlash.context.contextWindow === 1000000, JSON.stringify(resolvedFlash.context))
+  // Image input reaches the adapter only when the seam advertises it: the
+  // runtime projects images to text for a model that does not claim vision, so
+  // these two facts are what decide whether 识图 can work at all.
+  check('the vision model advertises image input on the real seam', Array.isArray(resolvedFlash.inputModalities) && resolvedFlash.inputModalities.includes('image'), JSON.stringify(resolvedFlash.inputModalities))
+  const resolvedTextOnly = await llm.resolveModelInfo('cline-pass', 'cline-pass/deepseek-v4-pro')
+  check('a text-only model does not advertise image input', Array.isArray(resolvedTextOnly.inputModalities) && !resolvedTextOnly.inputModalities.includes('image'), JSON.stringify(resolvedTextOnly.inputModalities))
   check('the real seam accepts the reasoning efforts', resolvedFlash.reasoning?.efforts.length === 7 && !resolvedFlash.reasoning.efforts.some((effort) => effort.id === 'off'), JSON.stringify(resolvedFlash.reasoning))
 
   // ── the tools ─────────────────────────────────────────────────────────────
@@ -179,6 +198,84 @@ try {
   const value = await status.execute({}, { signal: new AbortController().signal })
   check('the status tool runs against the mounted provider', value.provider === 'cline-pass' && value.routeRegistered === true && value.settingsAvailable === true, JSON.stringify(value))
   check('the status tool sees the configured account and its key', value.accounts.length === 1 && value.accounts[0].keyConfigured === true, JSON.stringify(value.accounts))
+
+  // ── the browser setup panel channel ───────────────────────────────────────
+  // The panel is published on the Connection RPC channel the browser half
+  // calls; its behaviour is covered offline in smoke.mjs. What only a mounted
+  // tree can show is that the Connection service really is present and that
+  // the client half's manifest was accepted by the real module scanner.
+  const connection = ctx.get('connection')
+  check('the Connection service mounted, so the browser transport exists', connection !== undefined && typeof connection.rpc?.handle === 'function')
+
+  // Mounting the client half is a host-side fact: the client-modules scanner
+  // must accept this package's `dsh.client` declaration and its ./client export.
+  const clientModules = ctx.get('clientModules')
+  check('the client module system mounted', clientModules !== undefined && typeof clientModules.graph === 'function')
+  const graph = clientModules.graph()
+  const rows = (graph?.entries ?? []).map((row) => row.id)
+  check('this package declares a browser bundle the module system accepted', rows.includes('dsh-cline-pass'), rows.join(',') || '(no client rows)')
+  const clientRow = (graph?.entries ?? []).find((row) => row.id === 'dsh-cline-pass')
+  check('the browser bundle is served from a revisioned URL', typeof clientRow?.url === 'string' && clientRow.url.includes('rev='), String(clientRow?.url))
+  check('the browser bundle declares the plugins it waits for', Array.isArray(clientRow?.inject) && clientRow.inject.includes('@deepseek-ai/dsh-client-connection'), JSON.stringify(clientRow?.inject))
+
+  // ── the panel route over real HTTP ────────────────────────────────────────
+  // A rendered browser half proves nothing about the host route it calls: a
+  // missing route silently falls through to the static fallback, which answers
+  // POST with 405. So the route is exercised over a real socket here.
+  const webServer = ctx.get('webServer')
+  check('the webserver mounted on an ephemeral port', Number.isSafeInteger(webServer?.port) && webServer.port > 0, String(webServer?.port))
+  const origin = `http://127.0.0.1:${webServer.port}`
+
+  const envelope = (method, payload = {}) => JSON.stringify({ endpoint: method, payload })
+
+  /** POST one panel action, optionally carrying the browser session cookie. */
+  const panelPost = async (body, cookie) => {
+    const response = await fetch(`${origin}${PANEL_PATH}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...(cookie === undefined ? {} : { cookie }) },
+      body,
+    })
+    const text = await response.text()
+    let json = null
+    try { json = JSON.parse(text) } catch { /* a non-JSON body is the caller's evidence */ }
+    return { status: response.status, text, json }
+  }
+
+  // Unauthenticated: a route inside the /api fence answers 401. A 404/405 means
+  // it never registered and the static fallback took the request instead —
+  // which is exactly the failure this check exists to catch.
+  const unauthenticated = await panelPost(envelope('state'))
+  check('the panel route is registered, not answered by the static fallback', unauthenticated.status === 401, `HTTP ${unauthenticated.status} — ${unauthenticated.text.slice(0, 60)}`)
+
+  // Authenticate the way the browser does: exchange the launch token for the
+  // session cookie, then speak the panel protocol with it. In a full Web
+  // composition the dist server claims the fallback seat and runs this
+  // exchange; this minimal tree has no dist, so root is mounted here on the
+  // very method that server calls.
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: '/',
+    handler: (req, res) => {
+      if (connection.authorizeIndex(req, res) === true) {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+        res.end('<!doctype html><html></html>')
+      }
+    },
+  }), 'mount-test: index seat')
+  const login = await fetch(connection.authenticatedUrl(origin), { redirect: 'manual' })
+  const cookie = (login.headers.getSetCookie?.() ?? [])[0]?.split(';')[0]
+  check('the browser session cookie was issued', typeof cookie === 'string' && cookie.length > 0, `HTTP ${login.status}`)
+
+  const stateResponse = await panelPost(envelope('state'), cookie)
+  check('the panel answers state over real HTTP', stateResponse.status === 200 && stateResponse.json?.ok === true, `HTTP ${stateResponse.status} — ${stateResponse.text.slice(0, 120)}`)
+  check('the panel state names the mounted route', stateResponse.json?.value?.provider === 'cline-pass', JSON.stringify(stateResponse.json?.value?.provider))
+  check('the panel state confirms the configured key', stateResponse.json?.value?.ready === true, JSON.stringify(stateResponse.json?.value?.ready))
+
+  const pinResponse = await panelPost(envelope('model.pin', { model: 'cline-pass/kimi-k3', upstreams: ['gmicloud'], pinMode: 'preferred', sort: 'ttft' }), cookie)
+  check('a panel write reaches the settings document', pinResponse.status === 200 && JSON.stringify(settings.get('cline-pass')?.perModel?.['cline-pass/kimi-k3']?.upstreams) === JSON.stringify(['gmicloud']), JSON.stringify(settings.get('cline-pass')?.perModel))
+
+  const unknownResponse = await panelPost(envelope('nope'), cookie)
+  check('an unknown action is a typed failure over the wire', unknownResponse.status === 200 && unknownResponse.json?.ok === false, `HTTP ${unknownResponse.status} — ${unknownResponse.text.slice(0, 120)}`)
 } catch (error) {
   failures.push(`unexpected failure — ${error?.stack ?? error}`)
 } finally {

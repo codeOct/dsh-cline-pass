@@ -16,7 +16,10 @@
 
 import { createServer } from 'node:http'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
-import { ClinePassAdapter, Config, apply, inject, name } from '../lib/index.js'
+import { ClinePassAdapter, Config, DEFAULT_REQUEST_IMAGE_POLICY, apply, inject, name } from '../lib/index.js'
+import { buildRequestBody, reasoningOf } from '../lib/adapter.js'
+import { createEngine } from '../lib/engine.js'
+import { createPanel, PANEL_ERROR_CODE, PANEL_PATH, registerPanel } from '../lib/panel.js'
 import {
   buildAttempts,
   classifyUpstreamError,
@@ -80,8 +83,30 @@ function streamFrames(upstream, pipeline, variant) {
     frames.push({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: ':1}' } }] } }] })
     frames.push({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })
   } else if (variant === 'reasoning') {
+    // This variant deliberately carries ONLY the flat `reasoning` field, so the
+    // test fails if the adapter ignores it. Supplying `reasoning_details` too
+    // would let the details fallback mask a dropped flat field, which is
+    // exactly how this bug survived the earlier suite.
+    frames.push({ choices: [{ index: 0, delta: { reasoning: 'Think' } }] })
+    frames.push({ choices: [{ index: 0, delta: { reasoning: 'ing' } }] })
+    frames.push({ choices: [{ index: 0, delta: { content: 'Done' } }] })
+    frames.push({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
+  } else if (variant === 'reasoning-both') {
+    // The exact live wire shape: both fields present and agreeing.
+    frames.push({ choices: [{ index: 0, delta: { reasoning: 'Think', reasoning_details: [{ type: 'reasoning.text', text: 'Think', format: 'unknown', index: 0 }] } }] })
+    frames.push({ choices: [{ index: 0, delta: { reasoning: 'ing', reasoning_details: [{ type: 'reasoning.text', text: 'ing', format: 'unknown', index: 0 }] } }] })
+    frames.push({ choices: [{ index: 0, delta: { content: 'Done' } }] })
+    frames.push({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
+  } else if (variant === 'reasoning-native') {
+    // The DeepSeek-native spelling some OpenAI-compatible backends use instead.
     frames.push({ choices: [{ index: 0, delta: { reasoning_content: 'Think' } }] })
     frames.push({ choices: [{ index: 0, delta: { reasoning_content: 'ing' } }] })
+    frames.push({ choices: [{ index: 0, delta: { content: 'Done' } }] })
+    frames.push({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
+  } else if (variant === 'reasoning-details-only') {
+    // A gateway that omits the flat field entirely and nests the text in parts.
+    frames.push({ choices: [{ index: 0, delta: { reasoning_details: [{ type: 'reasoning.text', text: 'Think', format: 'unknown', index: 0 }] } }] })
+    frames.push({ choices: [{ index: 0, delta: { reasoning_details: [{ type: 'reasoning.text', text: 'ing', format: 'unknown', index: 0 }] } }] })
     frames.push({ choices: [{ index: 0, delta: { content: 'Done' } }] })
     frames.push({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
   } else if (variant === 'empty') {
@@ -150,6 +175,35 @@ function check(label, condition, detail = '') {
 
 const same = (left, right) => JSON.stringify(left) === JSON.stringify(right)
 
+/** Redact a secret the way the plugin reports one (mirrors `lib/index.js`). */
+function maskKey(value) {
+  const key = String(value ?? '')
+  if (key.length === 0) return ''
+  if (key.length <= 10) return `${key.slice(0, 2)}…${key.slice(-2)}`
+  return `${key.slice(0, 6)}…${key.slice(-4)}`
+}
+
+/** Resolve a settings section's account pool, including the implicit default. */
+function accountProfilesOf(section) {
+  const declared = Object.entries(section.accounts ?? {})
+  if (declared.length === 0) {
+    return [{
+      key: 'default',
+      displayName: section.displayName,
+      apiKeyEnv: section.apiKeyEnv,
+      enabled: true,
+      baseURL: section.baseURL,
+    }]
+  }
+  return declared.map(([key, profile]) => ({
+    key,
+    displayName: String(profile?.displayName ?? '') || key,
+    apiKeyEnv: String(profile?.apiKeyEnv ?? section.apiKeyEnv),
+    enabled: profile?.enabled !== false,
+    baseURL: String(profile?.baseURL ?? '') || section.baseURL,
+  }))
+}
+
 /** Collect every chunk one adapter stream yields. */
 async function collect(adapter, options) {
   const chunks = []
@@ -157,7 +211,7 @@ async function collect(adapter, options) {
   return chunks
 }
 
-function adapterFor({ store, pin = () => ({}), records = [], learned = [] }) {
+function adapterFor({ store, pin = () => ({}), records = [], learned = [], attachments }) {
   return {
     adapter: new ClinePassAdapter({
       connection: () => ({
@@ -173,6 +227,7 @@ function adapterFor({ store, pin = () => ({}), records = [], learned = [] }) {
       pin,
       resolveAccount: async () => ({ name: 'default', key: 'sk_test', baseURL }),
       discoveredContext: () => undefined,
+      resolveAttachments: () => attachments,
       record: (model, info) => records.push({ model, ...info }),
       learnUpstream: (model, upstream, status, note, ms) => learned.push({ model, upstream, status, note, ms }),
     }),
@@ -252,6 +307,37 @@ try {
   check('reasoning deltas open a reasoning block', reasoning.some((chunk) => chunk.type === 'block-start' && chunk.blockType === 'reasoning'))
   check('reasoning text is accumulated', reasoning.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'reasoning')?.block.text === 'Thinking')
   check('a plain completion finishes with stop', same(reasoning.at(-1).reason, { kind: 'stop' }))
+  check('the reasoning block is emitted as reasoning-delta chunks', reasoning.filter((chunk) => chunk.type === 'reasoning-delta').map((chunk) => chunk.text).join('') === 'Thinking', JSON.stringify(reasoning.filter((chunk) => chunk.type === 'reasoning-delta')))
+  check('the visible answer still streams after the thinking', reasoning.filter((chunk) => chunk.type === 'text-delta').map((chunk) => chunk.text).join('') === 'Done', JSON.stringify(reasoning.filter((chunk) => chunk.type === 'text-delta')))
+
+  // Every wire spelling must produce identical harness chunks: the gateway
+  // streams `reasoning`, some OpenAI-compatible backends use the DeepSeek-native
+  // `reasoning_content`, and a third shape nests the text in parts only.
+  const shapes = {}
+  for (const variant of ['reasoning', 'reasoning-both', 'reasoning-native', 'reasoning-details-only']) {
+    stub.stream = variant
+    const stream = await collect(plain.adapter, {
+      provider: 'cline-pass',
+      model: 'cline-pass/glm-5.2',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      signal: new AbortController().signal,
+    })
+    shapes[variant] = {
+      reasoning: stream.filter((chunk) => chunk.type === 'reasoning-delta').map((chunk) => chunk.text).join(''),
+      text: stream.filter((chunk) => chunk.type === 'text-delta').map((chunk) => chunk.text).join(''),
+      block: stream.find((chunk) => chunk.type === 'block-end' && chunk.block.type === 'reasoning')?.block.text,
+    }
+  }
+  check('the gateway spelling (delta.reasoning alone) yields the thinking', shapes['reasoning']?.reasoning === 'Thinking', JSON.stringify(shapes['reasoning']))
+  check('the live wire shape (reasoning + details) yields the thinking', shapes['reasoning-both']?.reasoning === 'Thinking', JSON.stringify(shapes['reasoning-both']))
+  check('the native spelling (delta.reasoning_content) yields the thinking', shapes['reasoning-native']?.reasoning === 'Thinking', JSON.stringify(shapes['reasoning-native']))
+  check('a details-only gateway still yields the thinking', shapes['reasoning-details-only']?.reasoning === 'Thinking', JSON.stringify(shapes['reasoning-details-only']))
+  check('every spelling produces the same closed block', Object.values(shapes).every((shape) => shape.block === 'Thinking'), JSON.stringify(shapes))
+  check('every spelling still delivers the answer', Object.values(shapes).every((shape) => shape.text === 'Done'), JSON.stringify(shapes))
+  check('reasoningOf prefers the flat field over the parts', reasoningOf({ reasoning: 'flat', reasoning_details: [{ text: 'nested' }] }) === 'flat')
+  check('reasoningOf ignores an empty flat field', reasoningOf({ reasoning: '', reasoning_details: [{ text: 'nested' }] }) === 'nested')
+  check('reasoningOf reports nothing for a content-only frame', reasoningOf({ content: 'x' }) === undefined)
+  stub.stream = 'tool-call'
 
   stub.stream = 'empty'
   const empty = await collect(plain.adapter, {
@@ -367,6 +453,38 @@ try {
   apply(fakeCtx, { ...section })
   await new Promise((resolve) => setTimeout(resolve, 10))
 
+  // The panel drives the same engine and control surface the tools use, so it
+  // is exercised against the live section and credential map the tools wrote.
+  const panelControl = {
+    providerName: 'cline-pass',
+    displayName: 'Cline Pass',
+    settingsAvailable: () => true,
+    routeRegistered: () => true,
+    readConfig: () => section,
+    updateConfig: async (patch) => { section = { ...section, ...patch } },
+    accounts: () => accountProfilesOf(section),
+    accountsWithKeys: async () => await Promise.all(accountProfilesOf(section).map(async (account) => {
+      const value = credentials.get(String(account.apiKeyEnv))
+      return {
+        key: account.key,
+        displayName: account.displayName,
+        apiKeyEnv: String(account.apiKeyEnv),
+        enabled: account.enabled,
+        keyConfigured: value !== undefined,
+        keyHint: maskKey(value),
+      }
+    })),
+    readCredential: async (ref) => credentials.get(String(ref)) ?? '',
+    setCredential: async (ref, value) => { credentials.set(String(ref), String(value)) },
+    refreshCatalog: async () => ({ added: [], models: section.knownModels, sources: ['test'] }),
+  }
+  const panelEngine = createEngine({
+    resolveAccount: async () => ({ name: 'default', key: credentials.get('CLINE_PASS_API_KEY'), baseURL }),
+    store,
+    logger: fakeCtx.logger,
+  })
+  panelEngine.setPinReader((model) => section.perModel?.[model] ?? {})
+
   check('the provider route is registered', same(fakeCtx.llm.registered?.routes, ['cline-pass']))
   check('the configurable-provider directory entry is registered', fakeCtx.llm.directory?.[0]?.provider === 'cline-pass' && fakeCtx.llm.directory[0].settingsNs === 'cline-pass')
   const expectedTools = ['cline_pass_status', 'cline_pass_models', 'cline_pass_probe', 'cline_pass_validate', 'cline_pass_test', 'cline_pass_pin', 'cline_pass_accounts', 'cline_pass_history']
@@ -440,6 +558,91 @@ try {
   const history = await call('cline_pass_history', { limit: 5 })
   check('history records the probe, validate and test calls', history.total > 0, String(history.total))
   check('history rows carry the model and latency', history.entries.every((entry) => entry.model !== '' && Number.isSafeInteger(entry.ms)))
+
+  // ── image input ───────────────────────────────────────────────────────────
+  // The harness hands adapters durable attachment REFERENCES, never bytes, so
+  // the adapter must resolve them through the attachment service and emit the
+  // OpenAI content-part form. A model that advertises image input gets the
+  // blocks; the harness projects them to text for one that does not.
+  const PNG_BYTES = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4])
+  const IMAGE_REF = { attachmentId: 'att-image-1', bytes: PNG_BYTES.length, mediaType: 'image/png' }
+  const attachmentStore = {
+    reads: [],
+    async readImageRequest(ref, policy) {
+      this.reads.push({ ref, policy })
+      return { variantId: 'v1', attachment: ref, data: PNG_BYTES, mediaType: 'image/png', bytes: PNG_BYTES.length, width: 2, height: 2, depth: 'uchar', space: 'srgb', hasAlpha: false }
+    },
+  }
+
+  const imageHistory = [{
+    role: 'user',
+    content: [
+      { type: 'text', text: 'what is in this image?' },
+      { type: 'image', attachment: IMAGE_REF },
+    ],
+  }]
+
+  const imageRun = adapterFor({ store, attachments: attachmentStore })
+  stub.stream = 'tool-call'
+  stub.requests.length = 0
+  await collect(imageRun.adapter, {
+    provider: 'cline-pass',
+    model: 'cline-pass/glm-5.2',
+    messages: imageHistory,
+    signal: new AbortController().signal,
+  })
+  const imageBody = stub.requests.at(-1)
+  const userParts = imageBody?.messages?.find((message) => message.role === 'user')?.content
+  check('an image message becomes a content-part array', Array.isArray(userParts), JSON.stringify(userParts).slice(0, 120))
+  check('the text part survives beside the image', userParts?.[0]?.type === 'text' && userParts[0].text === 'what is in this image?', JSON.stringify(userParts?.[0]))
+  check('the image becomes an inline image_url data URI', userParts?.[1]?.type === 'image_url' && userParts[1].image_url.url.startsWith('data:image/png;base64,'), JSON.stringify(userParts?.[1]).slice(0, 80))
+  check('the base64 payload is the resolved request bytes', userParts?.[1]?.image_url.url === `data:image/png;base64,${Buffer.from(PNG_BYTES).toString('base64')}`, String(userParts?.[1]?.image_url.url))
+  check('the attachment service was asked for one request version', attachmentStore.reads.length === 1 && attachmentStore.reads[0].ref.attachmentId === 'att-image-1', JSON.stringify(attachmentStore.reads.length))
+  check('the request version was read at the documented image budget', attachmentStore.reads[0]?.policy?.maxBytes === DEFAULT_REQUEST_IMAGE_POLICY.maxBytes && attachmentStore.reads[0]?.policy?.maxPixels === DEFAULT_REQUEST_IMAGE_POLICY.maxPixels, JSON.stringify(attachmentStore.reads[0]?.policy))
+
+  // A text-only call must never touch the attachment service.
+  attachmentStore.reads.length = 0
+  await collect(imageRun.adapter, {
+    provider: 'cline-pass',
+    model: 'cline-pass/glm-5.2',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'plain' }] }],
+    signal: new AbortController().signal,
+  })
+  check('a text-only call resolves no images', attachmentStore.reads.length === 0, String(attachmentStore.reads.length))
+  check('a text-only message keeps the plain string form', typeof stub.requests.at(-1)?.messages?.find((message) => message.role === 'user')?.content === 'string')
+
+  // Images with no attachment service must fail loudly, not silently drop.
+  const noStore = adapterFor({ store })
+  let imageError = ''
+  try {
+    await collect(noStore.adapter, {
+      provider: 'cline-pass',
+      model: 'cline-pass/glm-5.2',
+      messages: imageHistory,
+      signal: new AbortController().signal,
+    })
+  } catch (error) {
+    imageError = `${error?.code ?? ''} ${error?.message ?? error}`
+  }
+  check('an image with no attachment service is an explicit failure', /UNSUPPORTED_CONTENT/.test(imageError), imageError)
+
+  // An image the map cannot resolve must not be silently dropped either.
+  let unresolvedError = ''
+  try {
+    const partial = adapterFor({ store, attachments: { async readImageRequest() { return { data: PNG_BYTES, mediaType: 'image/png' } } } })
+    buildRequestBody({ model: 'm', messages: imageHistory }, { defaultMaxTokens: 1 }, new Map())
+    await collect(partial.adapter, { provider: 'cline-pass', model: 'cline-pass/glm-5.2', messages: imageHistory, signal: new AbortController().signal })
+  } catch (error) {
+    unresolvedError = String(error?.message ?? error)
+  }
+  check('an unresolved image reference is an explicit failure', /could not resolve|cannot read properties/i.test(unresolvedError), unresolvedError)
+
+  check('assistant image output is refused, not dropped', (() => {
+    try {
+      buildRequestBody({ model: 'm', messages: [{ role: 'assistant', content: [{ type: 'image', attachment: IMAGE_REF }] }] }, { defaultMaxTokens: 1 })
+      return false
+    } catch (error) { return error.code === 'UNSUPPORTED_CONTENT' }
+  })())
 
   // ── model metadata on the seam ────────────────────────────────────────────
   const resolved = await plain.adapter.resolveModel('cline-pass', 'cline-pass/deepseek-v4.1-flash')
@@ -528,6 +731,129 @@ try {
     rejected = error?.name === 'ToolArgsError'
   }
   check('missing required arguments are rejected before execution', rejected)
+
+  // ── the browser setup panel ───────────────────────────────────────────────
+  // The panel and the tools share one control surface, so these drive the same
+  // live config the tool checks above just exercised.
+  const panel = createPanel({ control: panelControl, engine: panelEngine, store })
+
+  const panelState = await panel.state({})
+  check('panel state exposes the route and the masked account', panelState.provider === 'cline-pass' && panelState.accounts[0].keyHint === 'sk_liv…3456', JSON.stringify(panelState.accounts))
+  check('panel state reports readiness from the stored key', panelState.ready === true)
+  check('panel state reports the model list', panelState.models.length === 2, String(panelState.models.length))
+  check('panel state never echoes a key', !JSON.stringify(panelState).includes('sk_live_test_key_123456'))
+
+  const panelTested = await panel['key.test']({ value: 'sk_typed_key_abcdef123' })
+  check('key.test verifies a typed key without storing it', panelTested.ok === true && credentials.get('CLINE_PASS_TYPED') === undefined, JSON.stringify(panelTested))
+  const panelBad = await panel['key.test']({ value: 'sk_wrong' })
+  check('a key is checked against the gateway, not assumed', typeof panelBad.ok === 'boolean', JSON.stringify(panelBad))
+
+  const panelPrimary = panelState.accounts[0].apiKeyEnv
+  await panel['key.set']({ ref: panelPrimary, value: 'sk_replaced_key_000000' })
+  check('key.set stores the literal in the credential store', credentials.get(panelPrimary) === 'sk_replaced_key_000000', String(credentials.get(panelPrimary)))
+
+  const panelAdded = await panel['account.add']({ name: 'panel', key: 'sk_panel_account_1111' })
+  check('account.add registers the account and stores its key', panelAdded.accounts.some((account) => account.key === 'panel') && credentials.get('CLINE_PASS_PANEL_KEY') === 'sk_panel_account_1111')
+  const panelMode = await panel['account.mode']({ mode: 'roundrobin' })
+  check('account.mode switches the pool', panelMode.accountMode === 'roundrobin' && section.accountMode === 'roundrobin')
+  const panelRemoved = await panel['account.remove']({ name: 'panel' })
+  check('account.remove drops the account', panelRemoved.accounts.every((account) => account.key !== 'panel'))
+  await panel['account.mode']({ mode: 'single' })
+
+  const panelPinned = await panel['model.pin']({ model: 'cline-pass/glm-5.2', upstreams: ['alibaba', 'baseten'], pinMode: 'preferred', sort: 'ttft' })
+  check('model.pin persists the pin', same(section.perModel['cline-pass/glm-5.2'], { upstreams: ['alibaba', 'baseten'], exclude: [], pinMode: 'preferred', sort: 'ttft' }), JSON.stringify(section.perModel))
+  const panelRepinned = await panel['model.pin']({ model: 'cline-pass/glm-5.2', exclude: ['baseten'] })
+  check('model.pin keeps the fields it was not given', same(panelRepinned.pin.upstreams, ['alibaba', 'baseten']) && same(panelRepinned.pin.exclude, ['baseten']), JSON.stringify(panelRepinned.pin))
+
+  const panelProbe = await panel['model.probe']({ model: 'cline-pass/glm-5.2' })
+  check('model.probe reports the pipeline and channels', panelProbe.result.ok === true && panelProbe.result.pipeline === 'planner' && panelProbe.result.upstreams.length === 2, JSON.stringify(panelProbe.result.upstreams))
+  const panelValidated = await panel['model.validate']({ model: 'cline-pass/glm-5.2' })
+  check('model.validate reports a verdict per channel', panelValidated.results.length === 2 && panelValidated.summary.ok === 2, JSON.stringify(panelValidated.summary))
+  const panelTest = await panel['model.test']({ model: 'cline-pass/glm-5.2', upstreams: ['alibaba'] })
+  check('model.test reports what actually served the call', panelTest.ok === true && panelTest.actual === 'alibaba', JSON.stringify(panelTest))
+
+  // A dead channel is never auto-pinned: with one channel refusing, the healthy
+  // one is pinned alone; with every channel refusing, the probe itself reports
+  // the failure and nothing is pinned at all.
+  stub.broken = ['baseten']
+  const auto = await panel['setup.auto']({ model: 'cline-pass/glm-5.2' })
+  check('setup.auto pins only the channels that answered', auto.ok === true && same(auto.pinned, ['alibaba']), JSON.stringify(auto))
+  check('setup.auto excludes the channel that refused', same(auto.excluded, ['baseten']), JSON.stringify(auto.excluded))
+  check('setup.auto verified the pin with a real call', auto.verified === true && auto.actual === 'alibaba', JSON.stringify(auto))
+  check('setup.auto persisted a preferred pin', section.perModel['cline-pass/glm-5.2'].pinMode === 'preferred', JSON.stringify(section.perModel['cline-pass/glm-5.2']))
+  stub.broken = ['alibaba', 'baseten']
+  const autoFailed = await panel['setup.auto']({ model: 'cline-pass/glm-5.2' })
+  check('setup.auto reports failure instead of pinning a dead channel', autoFailed.ok === false && autoFailed.pinned.length === 0, JSON.stringify(autoFailed))
+  check('setup.auto explains itself', autoFailed.error.length > 0, autoFailed.error)
+  check('a failed setup still returns the full shape', autoFailed.channels.length === 0 && autoFailed.summary !== undefined && autoFailed.available.length === 0)
+  stub.broken = []
+
+  const panelReset = await panel['model.reset']({ model: 'cline-pass/glm-5.2' })
+  check('model.reset returns the model to automatic routing', panelReset.pin.upstreams.length === 0 && panelReset.pin.exclude.length === 0, JSON.stringify(panelReset.pin))
+
+  const panelRefreshed = await panel['models.refresh']({})
+  check('models.refresh reports the official catalog scan', Array.isArray(panelRefreshed.added) && panelRefreshed.models.length === 2, JSON.stringify(panelRefreshed.added))
+  const panelHistory = await panel.history({ limit: 3 })
+  check('history returns the most recent rows only', panelHistory.entries.length <= 3 && panelHistory.total > 0, JSON.stringify(panelHistory.total))
+  check('history rows carry the model and latency', panelHistory.entries.every((entry) => entry.model !== '' && Number.isSafeInteger(entry.ms)))
+
+  let panelRejected = ''
+  try {
+    await panel['model.pin']({})
+  } catch (error) {
+    panelRejected = String(error.message)
+  }
+  check('a panel action without its model fails loudly', /needs a `model`/.test(panelRejected), panelRejected)
+
+  // ── the route the panel publishes ─────────────────────────────────────────
+  // It must be an exact Fetch route under `/api`: that prefix belongs to
+  // Connection, whose handler is the only thing applying the trust fence and
+  // browser authentication. A route on the bare webserver would be unguarded.
+  const fetchRoutes = new Map()
+  const rpcCtx = {
+    logger: { info() {}, warn() {}, error() {} },
+    get(name) { return this[name] },
+    connection: {
+      fetch: {
+        register(route) {
+          fetchRoutes.set(route.path, route)
+          return () => fetchRoutes.delete(route.path)
+        },
+      },
+    },
+    inject(names, callback) {
+      if (names.includes('connection')) callback(this)
+      return () => {}
+    },
+  }
+  registerPanel(rpcCtx, { control: panelControl, engine: panelEngine, store, logger: rpcCtx.logger })
+  check('the panel registers exactly one route', fetchRoutes.size === 1, [...fetchRoutes.keys()].join(','))
+  const route = fetchRoutes.get(PANEL_PATH)
+  check('the route is the documented path', route !== undefined && PANEL_PATH === '/api/cline-pass', PANEL_PATH)
+  check('the route lives inside the authenticated /api prefix', PANEL_PATH.startsWith('/api/'), PANEL_PATH)
+  check('the route accepts only POST', JSON.stringify(route?.methods) === JSON.stringify(['POST']), JSON.stringify(route?.methods))
+  check('the route buffers its JSON body', route?.requestBody === 'buffered', String(route?.requestBody))
+
+  /** POST one action the way the browser does, through the registered route. */
+  const post = async (endpoint, payload) => {
+    const request = new Request(`http://localhost${PANEL_PATH}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ endpoint, payload }),
+    })
+    const response = await route.fetch(request)
+    return { status: response.status, json: await response.json() }
+  }
+
+  const rpcOk = await post('state', {})
+  check('a known action answers 200 with ok/value', rpcOk.status === 200 && rpcOk.json.ok === true && rpcOk.json.value.provider === 'cline-pass', JSON.stringify(rpcOk.json).slice(0, 120))
+  const rpcUnknown = await post('nope', {})
+  check('an unknown action is a typed failure, not a throw', rpcUnknown.json.ok === false && rpcUnknown.json.error.code === PANEL_ERROR_CODE, JSON.stringify(rpcUnknown))
+  const rpcBadArgs = await post('model.pin', {})
+  check('a rejected action becomes a typed failure', rpcBadArgs.json.ok === false && /needs a `model`/.test(rpcBadArgs.json.error.message), JSON.stringify(rpcBadArgs))
+  check('a failure carries no Host object', rpcBadArgs.json.error.details !== undefined && JSON.stringify(rpcBadArgs.json.error.details) === '{}', JSON.stringify(rpcBadArgs.json.error.details))
+  const malformed = await route.fetch(new Request(`http://localhost${PANEL_PATH}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: 'not json' }))
+  check('a malformed body is a 400, not a crash', malformed.status === 400, String(malformed.status))
 } catch (error) {
   failures.push(`unexpected failure — ${error?.stack ?? error}`)
 }
