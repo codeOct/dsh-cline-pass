@@ -9,7 +9,7 @@
 - 管理多个账号并轮询使用
 - 探测、测试、钉住或排除上游渠道
 - 在首个 token 前自动故障转移
-- 提供开箱即用的 Web 图形设置面板；也支持 `cline_pass_*` 工具自动化管理
+- 提供 Web 设置面板和 `cline_pass_*` 工具
 
 ## 要求
 
@@ -32,30 +32,20 @@ dsh plugin --profile web add ./dsh-cline-pass-0.1.0.tgz
 
 安装后重启 dsh。
 
-## 图形化配置（推荐）
-
-使用 `web` profile 启动 dsh 后，打开 **设置 → Cline Pass**：
-
-1. 在“账号”区域粘贴 API Key，点击 **保存并测试**。
-2. 在“订阅模型”区域选择模型，点击 **一键配置**。
-3. 需要手动调整时，展开模型行，点击渠道即可设置顺序；使用 `⊘` 排除渠道。
-
-面板会自动完成渠道探测、可用性测试和设置验证。Key 会保存到 dsh 凭据库，页面只显示掩码。
-
 ## 配置
 
-最简单的方式是设置环境变量：
+Web profile 可以在 **设置 → Cline Pass** 中保存和测试 Key。Key 会存入 dsh 凭据库，界面只显示掩码。
+
+也可以在启动 dsh 前设置环境变量：
 
 ```bash
 export CLINE_PASS_API_KEY=sk_xxx
 dsh --profile web
 ```
 
-如果不使用图形界面，可以设置环境变量。Key 也可以通过下方的工具接口写入 dsh 凭据库。
-
 ### 多账号
 
-在设置面板的“账号”区域添加账号即可。需要自动化时再调用工具：
+在设置面板中添加账号，并选择单账号或轮询模式。也可以调用工具：
 
 ```text
 cline_pass_accounts action=add name=main key=sk_xxx
@@ -82,7 +72,9 @@ cline_pass_accounts action=mode mode=roundrobin
 
 ## 上游渠道
 
-首次使用模型时，在面板点击 **一键配置** 即可。需要自动化时，可按以下顺序调用工具：
+首次使用模型时，可以在面板点击 **一键配置**，自动探测、校验和配置渠道。展开模型行可调整渠道顺序或排除渠道。
+
+也可以按以下顺序调用工具：
 
 ```text
 cline_pass_probe    model=cline-pass/glm-5.2

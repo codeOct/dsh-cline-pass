@@ -9,7 +9,7 @@ Connect [Cline Pass](https://cline.bot/cline-pass) subscription models to the [D
 - Multiple accounts with optional round-robin rotation
 - Probe, test, pin, or exclude upstream channels
 - Automatic failover before the first token
-- A ready-to-use Web settings panel, with `cline_pass_*` tools for automation
+- Web settings panel and `cline_pass_*` tools
 
 ## Requirements
 
@@ -32,30 +32,20 @@ dsh plugin --profile web add ./dsh-cline-pass-0.1.0.tgz
 
 Restart dsh after installation.
 
-## Configure in the Web panel (recommended)
-
-Start dsh with the `web` profile and open **Settings → Cline Pass**:
-
-1. Paste your API key in **Accounts** and click **Save and test**.
-2. Select a subscription model and click **Auto-configure**.
-3. Expand a model row to adjust channel order, or use `⊘` to exclude a channel.
-
-The panel probes channels, checks availability, and verifies the saved settings for you. Keys are stored in the dsh credential store and shown only in masked form.
-
 ## Configure
 
-The simplest option is an environment variable:
+With the Web profile, open **Settings → Cline Pass** to save and test a key. Keys are stored in the dsh credential store and shown only in masked form.
+
+You can also set an environment variable before starting dsh:
 
 ```bash
 export CLINE_PASS_API_KEY=sk_xxx
 dsh --profile web
 ```
 
-Without the graphical panel, use an environment variable. You can also use the tools below to write keys to the dsh credential store.
-
 ### Multiple accounts
 
-Add accounts in the **Accounts** section of the panel. For automation, use the tool interface:
+Add accounts in the settings panel and select single-account or round-robin mode. You can also use the tool interface:
 
 ```text
 cline_pass_accounts action=add name=main key=sk_xxx
@@ -82,7 +72,9 @@ Common settings include `baseURL`, `knownModels`, `models`, `perModel`, `exposeC
 
 ## Upstream channels
 
-For a new model, click **Auto-configure** in the panel. For automation, run the tools in this order:
+For a new model, click **Auto-configure** in the panel to probe, validate, and configure channels. Expand a model row to adjust channel order or exclude a channel.
+
+You can also run the tools in this order:
 
 ```text
 cline_pass_probe    model=cline-pass/glm-5.2
