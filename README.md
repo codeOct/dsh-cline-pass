@@ -119,6 +119,10 @@ npm run test:live:reasoning
 
 上游渠道和故障转移行为参考了 MIT 许可的 [`cline-pass-switcher`](https://github.com/munmunjaklin458-afk/cline-pass-switcher)。
 
+## 友情链接
+
+[LinuxDo](https://linux.do/) — 真诚、友善、团结、专业，你的品质开源与技术社区
+
 ## License
 
 [MIT](LICENSE)
