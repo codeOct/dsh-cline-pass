@@ -27,7 +27,7 @@ You can also install a local directory or tarball:
 
 ```bash
 dsh plugin --profile web add /path/to/dsh-cline-pass
-dsh plugin --profile web add ./dsh-cline-pass-0.1.0.tgz
+dsh plugin --profile web add ./dsh-cline-pass-<version>.tgz
 ```
 
 Restart dsh after installation.

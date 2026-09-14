@@ -26,6 +26,7 @@ import {
   extractAvailableProviders,
   injectPrefs,
   mergeUpstreams,
+  normalizeSort,
   parseRouting,
   parseTier0,
 } from '../lib/protocol.js'
@@ -258,6 +259,51 @@ try {
   check('excluded candidates are dropped from the chain', same(buildAttempts({ upstreams: ['a', 'b'], exclude: ['a'] }).map((attempt) => attempt.upstream), ['b']))
   check('an empty pin is one automatic candidate', same(buildAttempts({ upstreams: [], exclude: ['a'] }), [{ strict: true, sort: null, excludeList: ['a'], upstream: null, orderRest: [] }]))
   check('preferred candidates carry the rest as fallback order', same(buildAttempts({ upstreams: ['a', 'b'], pinMode: 'preferred' })[0].orderRest, ['b']))
+
+  // ── an empty sort must never reach the wire ────────────────────────────────
+  // The settings schema spells "no sort" as `''`, and the gateway rejects it:
+  // `providerOptions.gateway.sort: ""` is an HTTP 400 ("expected one of
+  // cost|ttft|tps|..."). Every config shape the panel or auto-configure can
+  // write is exercised here, because a single unnormalized empty string makes
+  // the whole model unusable.
+  check('normalizeSort maps an empty string to null', normalizeSort('') === null && normalizeSort(undefined) === null && normalizeSort(null) === null)
+  check('normalizeSort treats the documented "none" as no sort', normalizeSort('none') === null && normalizeSort('  ') === null)
+  check('normalizeSort keeps a real metric', normalizeSort('ttft') === 'ttft' && normalizeSort('cost') === 'cost')
+  check('an empty sort normalizes away in buildAttempts', buildAttempts({ upstreams: ['a'], pinMode: 'strict', sort: '' })[0].sort === null)
+  check('an empty sort injects no gateway sort', !('sort' in (injectPrefs({ model: 'm' }, { pipeline: 'planner' }, { upstream: 'a', strict: true, sort: '' }).providerOptions.gateway)))
+  check('an empty sort injects no direct sort', !('sort' in injectPrefs({ model: 'm' }, { pipeline: 'direct' }, { upstream: 'a', strict: true, sort: '' }).provider))
+  check('a "none" sort injects no sort either', !('sort' in (injectPrefs({ model: 'm' }, { pipeline: 'planner' }, buildAttempts({ upstreams: ['a'], pinMode: 'strict', sort: 'none' })[0]).providerOptions.gateway)))
+  check('a config with no channel and no sort injects nothing at all', injectPrefs({ model: 'm' }, { pipeline: 'planner' }, buildAttempts({ upstreams: [], exclude: [], pinMode: 'strict', sort: '' })[0]).providerOptions === undefined)
+
+  // Whatever a configuration says, the emitted sort is one the gateway accepts.
+  const SORT_VOCABULARY = new Set(['cost', 'ttft', 'tps', 'price', 'latency', 'throughput'])
+  const sortProblems = []
+  for (const sort of ['', undefined, null, 'none', 'ttft', 'cost', 'tps']) {
+    for (const pinMode of ['strict', 'preferred']) {
+      for (const upstreams of [[], ['a'], ['a', 'b']]) {
+        for (const pipeline of ['planner', 'direct', null]) {
+          const attempt = buildAttempts({ upstreams, exclude: [], pinMode, sort })[0]
+          const body = injectPrefs({ model: 'm' }, { pipeline, upstreams: ['a', 'b'] }, attempt)
+          const emitted = [body.provider?.sort, body.providerOptions?.gateway?.sort].filter((value) => value !== undefined)
+          for (const value of emitted) {
+            if (typeof value !== 'string' || value.length === 0 || !SORT_VOCABULARY.has(value)) {
+              sortProblems.push(`${JSON.stringify({ sort, pinMode, upstreams, pipeline })} -> ${JSON.stringify(value)}`)
+            }
+          }
+        }
+      }
+    }
+  }
+  check('no configuration can put an invalid sort on the wire', sortProblems.length === 0, sortProblems.slice(0, 3).join(' | '))
+
+  // An invalid-but-non-empty sort is the user's explicit choice and is passed
+  // through, so the gateway's own diagnostic names the value.
+  check('a real sort still reaches both spellings', (() => {
+    const attempt = buildAttempts({ upstreams: ['a'], pinMode: 'strict', sort: 'ttft' })[0]
+    const planner = injectPrefs({ model: 'm' }, { pipeline: 'planner' }, attempt)
+    const direct = injectPrefs({ model: 'm' }, { pipeline: 'direct' }, attempt)
+    return planner.providerOptions.gateway.sort === 'ttft' && direct.provider.sort === 'latency'
+  })())
 
   check('routing is read from planner metadata', parseRouting({ provider_metadata: { gateway: { routing: { finalProvider: 'alibaba', canonicalSlug: 'z-ai/glm-5.2' } } } }).pipeline === 'planner')
   check('routing is read from a direct provider field', parseRouting({ provider: 'GMICloud', model: 'z-ai/glm-5.2', choices: [{ message: { content: 'hi' } }] }).pipeline === 'direct')

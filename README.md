@@ -27,7 +27,7 @@ dsh plugin --profile web add dsh-cline-pass
 
 ```bash
 dsh plugin --profile web add /path/to/dsh-cline-pass
-dsh plugin --profile web add ./dsh-cline-pass-0.1.0.tgz
+dsh plugin --profile web add ./dsh-cline-pass-<version>.tgz
 ```
 
 安装后重启 dsh。
