@@ -118,17 +118,31 @@ const windowStub = {
 
 let missingRequires = []
 
+// The platform seed table publishes more than React; the plugin card draws the
+// host's own disclosure chevron with the shared primitives, so the stub answers
+// that specifier too rather than recording it as a missing external.
+const PRIMITIVES_SPECIFIER = '@deepseek-ai/dsh-client-ui-primitives'
+const primitivesStub = { IconChevronDownOutline14: () => null }
+
 function makeRequire() {
   const React = {
     createElement,
     Fragment: Symbol('Fragment'),
-    useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
+    // A boolean is this panel's disclosure state: the plugin card, the account
+    // card and every model row fold with one. The stub opens them so those
+    // bodies are part of the rendered tree — a collapsed card renders its
+    // header alone, and the copy asserted below lives in the body.
+    useState: (initial) => {
+      const value = typeof initial === 'function' ? initial() : initial
+      return [value === false ? true : value, () => {}]
+    },
     useEffect: () => {},
     useMemo: (factory) => factory(),
     useRef: () => ({ current: undefined }),
   }
   return (specifier) => {
     if (specifier === 'react') return React
+    if (specifier === PRIMITIVES_SPECIFIER) return primitivesStub
     missingRequires.push(specifier)
     throw new Error(`client-modules: require("${specifier}") missed the module table`)
   }
@@ -227,11 +241,15 @@ try {
 check('apply() runs without throwing', applyError === null, applyError?.message ?? '')
 
 const keys = registrations.map((registration) => `${registration.options.name}:${registration.options.key ?? registration.options.id ?? ''}`)
-check('every declared slot is registered', registrations.length === 3, keys.join(' '))
-check('a Settings page is registered', registrations.some((registration) => registration.options.name === 'settings.section' && registration.options.id === 'cline-pass'), keys.join(' '))
+check('every declared slot is registered', registrations.length === 2, keys.join(' '))
 check('a Plugins card is registered', registrations.some((registration) => registration.options.name === 'settings.plugin.item' && registration.options.key === 'cline-pass'), keys.join(' '))
 check('a Models-page card is registered', registrations.some((registration) => registration.options.name === 'settings.models.provider-card' && registration.options.key === 'cline-pass'), keys.join(' '))
-check('the settings section carries a nav label thunk', typeof registrations.find((registration) => registration.options.name === 'settings.section')?.options.label === 'function')
+// The configurable-plugins tab sorts a keyed slot by `priority`, and the route
+// asks to lead the list so its own card is not buried under the host's.
+check('the Plugins card asks to lead the list', registrations.find((registration) => registration.options.name === 'settings.plugin.item')?.options.priority === -1, String(registrations.find((registration) => registration.options.name === 'settings.plugin.item')?.options.priority))
+// One surface, not two: the panel lives in the Plugins card alone, so no
+// Settings-nav entry duplicates it.
+check('no Settings page duplicates the Plugins card', !registrations.some((registration) => registration.options.name === 'settings.section'), keys.join(' '))
 
 // ── the panel's own copy follows the active locale ──────────────────────────
 
@@ -257,27 +275,48 @@ function echoingLocale(active) {
   }
 }
 
-const sectionRegistrationForText = registrations.find((registration) => registration.options.name === 'settings.section')
+/**
+ * Expand function components so a nested body is part of the tree.
+ *
+ * `runComponent` invokes the top-level component only, and this card keeps the
+ * panel one level down (the disclosure body). Collecting text without expanding
+ * would see the card's header alone.
+ */
+function resolveComponents(node) {
+  if (node === null || node === undefined || typeof node !== 'object') return node
+  if (Array.isArray(node)) return node.map(resolveComponents)
+  if (typeof node.type === 'function') return resolveComponents(node.type(node.props))
+  return { ...node, props: { ...node.props, children: resolveComponents(node.props?.children) } }
+}
 
-function renderSectionText() {
-  return collectText(runComponent(sectionRegistrationForText.component, propsFor(sectionRegistrationForText)).tree).join(' ')
+// The Plugins card is the one configuration surface, and it is a disclosure the
+// stub above opens, so its body — the panel — is what this renders.
+const cardRegistrationForText = registrations.find((registration) => registration.options.name === 'settings.plugin.item')
+
+function renderCardText() {
+  return collectText(resolveComponents(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)).join(' ')
 }
 
 // A namespace the shared registry knows nothing about makes `locale.bind` echo
 // the key back rather than throw. The panel must still render its own copy.
+//
+// These assertions name copy that renders before any read has answered: the
+// card header and the panel's status line. The sections below the status line
+// wait for the route to be configured, so they are not part of this tree — the
+// store starts in its loading state here because effects are captured, not run.
 stubLocale = echoingLocale('zh')
-const chinese = renderSectionText()
-check('an unresolved locale lookup still renders Chinese copy', chinese.includes('尚未配置 API Key') && chinese.includes('最近请求'), chinese.slice(0, 160))
+const chinese = renderCardText()
+check('an unresolved locale lookup still renders Chinese copy', chinese.includes('尚未配置 API Key') && chinese.includes('订阅模型的渠道钉住'), chinese.slice(0, 160))
 check('no raw i18n key leaks into the rendered panel', !/\bkeyMissing\b|\bnotReady\b|\bautoSetup\b|\bhistory\b/.test(chinese), chinese.slice(0, 200))
 
 stubLocale = echoingLocale('en')
-const english = renderSectionText()
-check('an English locale renders English copy', english.includes('No API key') && english.includes('Recent requests'), english.slice(0, 160))
+const english = renderCardText()
+check('an English locale renders English copy', english.includes('No API key') && english.includes('Channel pins'), english.slice(0, 160))
 check('the two locales really differ', chinese !== english)
 
 // With no locale service at all the bundled Chinese dictionary is the default.
 stubLocale = undefined
-check('a composition without the locale service still renders Chinese', renderSectionText().includes('尚未配置 API Key'))
+check('a composition without the locale service still renders Chinese', renderCardText().includes('尚未配置 API Key'))
 
 // ── call every registered component ─────────────────────────────────────────
 
@@ -317,8 +356,8 @@ for (const registration of registrations) {
 
 // ── the registration face is live, not a snapshot ───────────────────────────
 
-const sectionRegistration = registrations.find((registration) => registration.options.name === 'settings.section')
-const firstFace = propsFor(sectionRegistration)
+const faceRegistration = registrations.find((registration) => registration.options.name === 'settings.plugin.item')
+const firstFace = propsFor(faceRegistration)
 check('the injected face exposes the store hook', typeof firstFace.useClinePass === 'function')
 const snapshotA = firstFace.useClinePass((value) => value)
 check('the store starts in a loading state', snapshotA.status === 'loading', JSON.stringify(snapshotA).slice(0, 80))
@@ -326,7 +365,7 @@ check('the store is uSES-safe (same reference between reads)', firstFace.useClin
 
 // The actions the panel exposes must all be callable; each one is what a
 // button in the rendered tree binds to.
-for (const name of ['refresh', 'setKey', 'testKey', 'saveAndTest', 'addAccount', 'removeAccount', 'setAccountMode', 'pinModel', 'setupModel', 'probeModel', 'validateModel', 'testModel', 'resetModel', 'refreshModels', 'loadHistory']) {
+for (const name of ['refresh', 'setKey', 'testKey', 'saveAndTest', 'addAccount', 'removeAccount', 'setAccountMode', 'setAccountEnabled', 'pinModel', 'setModelVisible', 'setModelsVisibility', 'setupModel', 'probeModel', 'validateModel', 'testModel', 'resetModel', 'refreshModels', 'loadUsage', 'loadPlan', 'loadUsageWindows', 'loadHistory']) {
   check(`the injected face exposes ${name}`, typeof firstFace[name] === 'function')
 }
 
