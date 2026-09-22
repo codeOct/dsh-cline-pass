@@ -350,6 +350,21 @@ try {
   // measured from the request's start so it can be read next to `ms`.
   check('the successful call records when its first chunk arrived', Number.isSafeInteger(plain.records[0].ttft) && plain.records[0].ttft > 0, JSON.stringify(plain.records[0].ttft))
   check('the first chunk never arrives after the request ends', plain.records[0].ttft <= plain.records[0].ms, `${plain.records[0].ttft} vs ${plain.records[0].ms}`)
+  // The first byte is the gateway starting to talk at all; the pair is what tells
+  // "the socket is warm while the model thinks" from "the gateway said nothing".
+  check('the successful call records when its first byte arrived', Number.isSafeInteger(plain.records[0].ttfb) && plain.records[0].ttfb > 0, JSON.stringify(plain.records[0].ttfb))
+  check('the first byte never follows the first chunk', plain.records[0].ttfb <= plain.records[0].ttft, `${plain.records[0].ttfb} vs ${plain.records[0].ttft}`)
+  // Token counts come from the usage frame, which the gateway sends last, so
+  // capturing it means reading the chunk on its way to the caller. The reasoning
+  // count is what explains a long first-chunk wait: it is thinking the caller
+  // cannot see, because this gateway does not stream it.
+  check('the successful call records its token usage', plain.records[0].usage?.inputTokens === 8 && plain.records[0].usage?.outputTokens === 5, JSON.stringify(plain.records[0].usage))
+  // The cache count is present in this frame; the reasoning count is optional —
+  // `mapUsage` only carries it when the gateway reported it, so absent is a legal
+  // state and must not be read as zero reasoning.
+  check('the recorded usage carries the cache count', plain.records[0].usage?.cacheReadTokens === 2, JSON.stringify(plain.records[0].usage))
+  check('the reasoning count is either reported or absent', plain.records[0].usage?.reasoningTokens === undefined || Number.isSafeInteger(plain.records[0].usage.reasoningTokens), JSON.stringify(plain.records[0].usage))
+  check('the call records the reasoning effort it ran at', typeof plain.records[0].effort === 'string', JSON.stringify(plain.records[0].effort))
   check('the request carried the pinned model and stream flag', stub.requests.at(-1).model === 'cline-pass/glm-5.2' && stub.requests.at(-1).stream === true)
   check('the system prompt and tool schema reached the wire', stub.requests.at(-1).messages[0].role === 'system' && stub.requests.at(-1).tools[0].function.name === 'echo')
 
@@ -440,6 +455,7 @@ try {
   // Zero is the fact "nothing ever arrived", not a missing measurement: the
   // panel renders it as a dash rather than as an instant answer.
   check('a call that streamed nothing records a zero first-chunk time', exhausted.records[0].ttft === 0, JSON.stringify(exhausted.records[0].ttft))
+  check('a call that never got a byte records a zero first-byte time', exhausted.records[0].ttfb === 0, JSON.stringify(exhausted.records[0].ttfb))
   stub.broken = []
 
   // ── tools through the plugin ──────────────────────────────────────────────
@@ -916,9 +932,14 @@ try {
   const panelHistory = await panel.history({ limit: 3 })
   check('history returns the most recent rows only', panelHistory.entries.length <= 3 && panelHistory.total > 0, JSON.stringify(panelHistory.total))
   check('history rows carry the model and latency', panelHistory.entries.every((entry) => entry.model !== '' && Number.isSafeInteger(entry.ms)))
-  // The panel projects the same rows the tool returns, first-chunk time included;
-  // the two lists must not disagree about what a request cost.
+  // The panel projects the same rows the tool returns, both timing marks
+  // included; the two lists must not disagree about what a request cost.
   check('the panel history carries the first-chunk time too', panelHistory.entries.every((entry) => Number.isSafeInteger(entry.ttft) && entry.ttft >= 0), JSON.stringify(panelHistory.entries.map((entry) => entry.ttft)))
+  check('the panel history carries the first-byte time too', panelHistory.entries.every((entry) => Number.isSafeInteger(entry.ttfb) && entry.ttfb >= 0), JSON.stringify(panelHistory.entries.map((entry) => entry.ttfb)))
+  // The token counts and the "was usage reported" flag have to survive the
+  // projection too, or the panel renders a dash for a call that reported usage.
+  check('the panel history carries the token counts too', panelHistory.entries.every((entry) => typeof entry.usageReported === 'boolean' && Number.isSafeInteger(entry.usage?.inputTokens ?? NaN)), JSON.stringify(panelHistory.entries.map((entry) => entry.usage)))
+  check('the panel history carries the reasoning effort too', panelHistory.entries.every((entry) => typeof entry.effort === 'string'))
   check('a panel row never reports a later first chunk than its total', panelHistory.entries.every((entry) => entry.ttft === 0 || entry.ttft <= entry.ms))
 
   let panelRejected = ''
