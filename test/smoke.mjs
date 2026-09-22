@@ -346,6 +346,10 @@ try {
   check('finish reports the tool-call reason', same(chunks.at(-1), { type: 'finish', reason: { kind: 'tool-calls' } }), JSON.stringify(chunks.at(-1)))
   check('the finish chunk is last', types.at(-1) === 'finish')
   check('history recorded the serving upstream', plain.records.length === 1 && plain.records[0].provider === 'alibaba', JSON.stringify(plain.records))
+  // First-chunk time is what a user waits before anything appears, and it is
+  // measured from the request's start so it can be read next to `ms`.
+  check('the successful call records when its first chunk arrived', Number.isSafeInteger(plain.records[0].ttft) && plain.records[0].ttft > 0, JSON.stringify(plain.records[0].ttft))
+  check('the first chunk never arrives after the request ends', plain.records[0].ttft <= plain.records[0].ms, `${plain.records[0].ttft} vs ${plain.records[0].ms}`)
   check('the request carried the pinned model and stream flag', stub.requests.at(-1).model === 'cline-pass/glm-5.2' && stub.requests.at(-1).stream === true)
   check('the system prompt and tool schema reached the wire', stub.requests.at(-1).messages[0].role === 'system' && stub.requests.at(-1).tools[0].function.name === 'echo')
 
@@ -433,6 +437,9 @@ try {
   }
   check('every candidate failing raises one clear error', /refused the pin/.test(exhaustedError), exhaustedError)
   check('the failed call is recorded with its whole trace', exhausted.records.length === 1 && same(exhausted.records[0].attempts, ['baseten', 'alibaba']), JSON.stringify(exhausted.records))
+  // Zero is the fact "nothing ever arrived", not a missing measurement: the
+  // panel renders it as a dash rather than as an instant answer.
+  check('a call that streamed nothing records a zero first-chunk time', exhausted.records[0].ttft === 0, JSON.stringify(exhausted.records[0].ttft))
   stub.broken = []
 
   // ── tools through the plugin ──────────────────────────────────────────────
@@ -666,6 +673,11 @@ try {
   const history = await call('cline_pass_history', { limit: 5 })
   check('history records the probe, validate and test calls', history.total > 0, String(history.total))
   check('history rows carry the model and latency', history.entries.every((entry) => entry.model !== '' && Number.isSafeInteger(entry.ms)))
+  // The tool hands the same latency pair the panel shows, and the render
+  // spells it as `first/total`.
+  check('history rows carry the first-chunk time', history.entries.every((entry) => Number.isSafeInteger(entry.ttft) && entry.ttft >= 0), JSON.stringify(history.entries.map((entry) => entry.ttft)))
+  const historyText = tools.get('cline_pass_history').output.render({ limit: 5 }, history).map((block) => block.text).join('\n')
+  check('the history render spells out first-chunk over total', /\d+ms\/\d+ms|—\/\d+ms/.test(historyText), historyText.slice(0, 200))
 
   // ── image input ───────────────────────────────────────────────────────────
   // The harness hands adapters durable attachment REFERENCES, never bytes, so
@@ -904,6 +916,10 @@ try {
   const panelHistory = await panel.history({ limit: 3 })
   check('history returns the most recent rows only', panelHistory.entries.length <= 3 && panelHistory.total > 0, JSON.stringify(panelHistory.total))
   check('history rows carry the model and latency', panelHistory.entries.every((entry) => entry.model !== '' && Number.isSafeInteger(entry.ms)))
+  // The panel projects the same rows the tool returns, first-chunk time included;
+  // the two lists must not disagree about what a request cost.
+  check('the panel history carries the first-chunk time too', panelHistory.entries.every((entry) => Number.isSafeInteger(entry.ttft) && entry.ttft >= 0), JSON.stringify(panelHistory.entries.map((entry) => entry.ttft)))
+  check('a panel row never reports a later first chunk than its total', panelHistory.entries.every((entry) => entry.ttft === 0 || entry.ttft <= entry.ms))
 
   let panelRejected = ''
   try {
