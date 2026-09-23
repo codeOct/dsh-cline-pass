@@ -248,6 +248,12 @@ try {
 
   check('plugin identity', name === 'cline-pass' && same(inject, ['llm', 'tools']))
   check('config schema compiles', typeof Config === 'object' || typeof Config === 'function')
+  // From dsh 0.1.6 the settings service refuses EVERY write to an entry whose
+  // schema declares no volatile field (`volatileForm` returns undefined), which
+  // makes the panel's saves fail while its reads still work — exactly the
+  // "buttons do nothing" failure. The whole section is live: every consumer
+  // reads through the plugin's `current()` source thunk.
+  check('the config section is declared volatile so settings writes are accepted', Config.meta?.volatile === true, String(Config.meta?.volatile))
 
   const plannerPin = injectPrefs({ model: 'm' }, { pipeline: 'planner', upstreams: ['alibaba', 'baseten'] }, { upstream: 'alibaba', strict: true, sort: 'cost' })
   check('strict pin on the planner pipeline uses providerOptions.gateway.only', same(plannerPin.providerOptions, { gateway: { only: ['alibaba'], sort: 'cost' } }), JSON.stringify(plannerPin))
