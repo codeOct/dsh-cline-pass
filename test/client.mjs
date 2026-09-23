@@ -118,13 +118,24 @@ const windowStub = {
 
 let missingRequires = []
 
-// The platform seed table publishes more than React; the plugin card draws the
-// host's own disclosure chevron with the shared primitives, so the stub answers
-// that specifier too rather than recording it as a missing external.
+// The platform seed table publishes more than React; the plugin draws its
+// disclosure chevrons with the shared primitives, so the stub answers that
+// specifier too rather than recording it as a missing external.
+//
+// The icon export was renamed between host lines, so the stub below is the
+// 0.1.2–0.1.5 shape (`…Outline14`) and the postures further down cover the two
+// other shapes a host can present. `stableChevronCalls` proves this shape is
+// the one actually used, not merely tolerated.
 const PRIMITIVES_SPECIFIER = '@deepseek-ai/dsh-client-ui-primitives'
-const primitivesStub = { IconChevronDownOutline14: () => null }
+let stableChevronCalls = 0
+const primitivesStub = {
+  IconChevronDownOutline14: () => {
+    stableChevronCalls += 1
+    return null
+  },
+}
 
-function makeRequire() {
+function makeRequire(primitives = primitivesStub) {
   const React = {
     createElement,
     Fragment: Symbol('Fragment'),
@@ -142,7 +153,7 @@ function makeRequire() {
   }
   return (specifier) => {
     if (specifier === 'react') return React
-    if (specifier === PRIMITIVES_SPECIFIER) return primitivesStub
+    if (specifier === PRIMITIVES_SPECIFIER) return primitives
     missingRequires.push(specifier)
     throw new Error(`client-modules: require("${specifier}") missed the module table`)
   }
@@ -352,6 +363,70 @@ for (const registration of registrations) {
   // Effects are captured, never run: the RPC read they trigger needs a live
   // browser session, and running it here would assert nothing about rendering.
   check(`rendering ${label} registers effects without throwing`, Array.isArray(result.effects))
+}
+
+// ── the disclosure chevron across host icon sets ────────────────────────────
+//
+// The icon export was renamed between host lines: 0.1.2–0.1.5 ships
+// `IconChevronDownOutline14`, 0.1.6+ ships `…Regular` / `…Medium`. A bundle
+// that destructures one name and calls it crashes the whole panel on the other
+// host, so each posture below must still render, and the fallback must be a
+// real drawing rather than `undefined`.
+check('the 0.1.2–0.1.5 chevron export is the one used', stableChevronCalls > 0, String(stableChevronCalls))
+
+/** Render one registration under a given primitives module. */
+function renderWith(primitives, registration) {
+  const load = []
+  const win = {
+    __ModuleLoader__: { load: (e) => load.push(e) },
+    document: documentStub,
+  }
+  const previous = globalThis.window
+  globalThis.window = win
+  try {
+    const run = new Function('window', 'document', 'require', source)
+    run(win, documentStub, makeRequire(primitives))
+  } finally {
+    if (previous === undefined) delete globalThis.window
+    else globalThis.window = previous
+  }
+  const exportsUnderTest = load[0].factory(makeRequire(primitives))
+  const seen = []
+  const slots = {
+    inject: (key, callback) => { callback(); return () => {} },
+    register: (options, component) => { seen.push({ options, component }); return () => {} },
+  }
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    slots,
+    connection: connectionService,
+    effect: (body) => {
+      const dispose = body()
+      return typeof dispose === 'function' ? dispose : () => {}
+    },
+    get: (name) => (name === 'slots' ? slots : name === 'connection' ? connectionService : undefined),
+  }
+  exportsUnderTest.apply(ctx)
+  const target = seen.find((entry) => entry.options.name === registration)
+  if (target === undefined) return { tree: null, effects: [] }
+  return runComponent(target.component, propsFor(target))
+}
+
+for (const [label, primitives] of [
+  ['0.1.6+ artwork/regular/medium triple', { IconChevronDownOutlineRegular: () => null, IconChevronDownOutlineMedium: () => null }],
+  ['a seed table without any chevron icon', {}],
+]) {
+  let result = null
+  try {
+    result = renderWith(primitives, 'settings.plugins.tab')
+  } catch (error) {
+    failures.push(`rendering the Plugins tab under ${label} threw: ${error?.message ?? error}`)
+    continue
+  }
+  check(`the Plugins tab renders under ${label}`, result.tree !== null && result.tree !== undefined)
+  // The fallback is an inline <svg>; `undefined` as an element type is the
+  // crash this guards against, and JSON keeps it out of the tree entirely.
+  check(`no undefined element type leaks under ${label}`, !JSON.stringify(result.tree ?? null).includes('"type":null'), JSON.stringify(result.tree ?? null).slice(0, 120))
 }
 
 // ── the registration face is live, not a snapshot ───────────────────────────
