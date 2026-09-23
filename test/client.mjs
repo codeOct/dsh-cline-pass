@@ -242,14 +242,14 @@ check('apply() runs without throwing', applyError === null, applyError?.message 
 
 const keys = registrations.map((registration) => `${registration.options.name}:${registration.options.key ?? registration.options.id ?? ''}`)
 check('every declared slot is registered', registrations.length === 2, keys.join(' '))
-check('a Plugins card is registered', registrations.some((registration) => registration.options.name === 'settings.plugin.item' && registration.options.key === 'cline-pass'), keys.join(' '))
+check('a Plugins tab is registered', registrations.some((registration) => registration.options.name === 'settings.plugins.tab' && registration.options.id === 'cline-pass'), keys.join(' '))
 check('a Models-page card is registered', registrations.some((registration) => registration.options.name === 'settings.models.provider-card' && registration.options.key === 'cline-pass'), keys.join(' '))
-// The configurable-plugins tab sorts a keyed slot by `priority`, and the route
-// asks to lead the list so its own card is not buried under the host's.
-check('the Plugins card asks to lead the list', registrations.find((registration) => registration.options.name === 'settings.plugin.item')?.options.priority === -1, String(registrations.find((registration) => registration.options.name === 'settings.plugin.item')?.options.priority))
-// One surface, not two: the panel lives in the Plugins card alone, so no
+// `settings.plugins.tab` is a list slot ordered by `order`; the host's own
+// inventory tab sits at 10, so the route's tab is placed after it.
+check('the Plugins tab carries an order and a locale label thunk', registrations.find((registration) => registration.options.name === 'settings.plugins.tab')?.options.order === 20 && typeof registrations.find((registration) => registration.options.name === 'settings.plugins.tab')?.options.label === 'function', keys.join(' '))
+// One surface, not two: the panel lives in the Plugins tab alone, so no
 // Settings-nav entry duplicates it.
-check('no Settings page duplicates the Plugins card', !registrations.some((registration) => registration.options.name === 'settings.section'), keys.join(' '))
+check('no Settings page duplicates the Plugins panel', !registrations.some((registration) => registration.options.name === 'settings.section'), keys.join(' '))
 
 // ── the panel's own copy follows the active locale ──────────────────────────
 
@@ -289,9 +289,9 @@ function resolveComponents(node) {
   return { ...node, props: { ...node.props, children: resolveComponents(node.props?.children) } }
 }
 
-// The Plugins card is the one configuration surface, and it is a disclosure the
+// The Plugins tab is the one configuration surface, and it is a disclosure the
 // stub above opens, so its body — the panel — is what this renders.
-const cardRegistrationForText = registrations.find((registration) => registration.options.name === 'settings.plugin.item')
+const cardRegistrationForText = registrations.find((registration) => registration.options.name === 'settings.plugins.tab')
 
 function renderCardText() {
   return collectText(resolveComponents(runComponent(cardRegistrationForText.component, propsFor(cardRegistrationForText)).tree)).join(' ')
@@ -356,7 +356,7 @@ for (const registration of registrations) {
 
 // ── the registration face is live, not a snapshot ───────────────────────────
 
-const faceRegistration = registrations.find((registration) => registration.options.name === 'settings.plugin.item')
+const faceRegistration = registrations.find((registration) => registration.options.name === 'settings.plugins.tab')
 const firstFace = propsFor(faceRegistration)
 check('the injected face exposes the store hook', typeof firstFace.useClinePass === 'function')
 const snapshotA = firstFace.useClinePass((value) => value)
