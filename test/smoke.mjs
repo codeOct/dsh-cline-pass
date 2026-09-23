@@ -17,7 +17,7 @@
 import { createServer } from 'node:http'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { ClinePassAdapter, Config, DEFAULT_REQUEST_IMAGE_POLICY, apply, inject, name } from '../lib/index.js'
-import { buildRequestBody, reasoningOf } from '../lib/adapter.js'
+import { buildRequestBody, projectImageDimensions, reasoningOf, requestImageTarget } from '../lib/adapter.js'
 import { createEngine } from '../lib/engine.js'
 import { createPanel, PANEL_ERROR_CODE, PANEL_PATH, registerPanel } from '../lib/panel.js'
 import {
@@ -701,7 +701,9 @@ try {
   // OpenAI content-part form. A model that advertises image input gets the
   // blocks; the harness projects them to text for one that does not.
   const PNG_BYTES = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4])
-  const IMAGE_REF = { attachmentId: 'att-image-1', bytes: PNG_BYTES.length, mediaType: 'image/png' }
+  // Every durable image reference carries its own intrinsic size; the request
+  // target is derived from it, so the fixture must carry it too.
+  const IMAGE_REF = { attachmentId: 'att-image-1', bytes: PNG_BYTES.length, mediaType: 'image/png', width: 2, height: 2 }
   const attachmentStore = {
     reads: [],
     async readImageRequest(ref, policy) {
@@ -735,6 +737,13 @@ try {
   check('the base64 payload is the resolved request bytes', userParts?.[1]?.image_url.url === `data:image/png;base64,${Buffer.from(PNG_BYTES).toString('base64')}`, String(userParts?.[1]?.image_url.url))
   check('the attachment service was asked for one request version', attachmentStore.reads.length === 1 && attachmentStore.reads[0].ref.attachmentId === 'att-image-1', JSON.stringify(attachmentStore.reads.length))
   check('the request version was read at the documented image budget', attachmentStore.reads[0]?.policy?.maxBytes === DEFAULT_REQUEST_IMAGE_POLICY.maxBytes && attachmentStore.reads[0]?.policy?.maxPixels === DEFAULT_REQUEST_IMAGE_POLICY.maxPixels, JSON.stringify(attachmentStore.reads[0]?.policy))
+  // The two host lines validate opposite shapes, so the target must carry both
+  // or every image fails on one of them: 0.1.2-0.1.5 check `maxPixels`/`maxBytes`,
+  // 0.1.6+ check `width`/`height`/`maxBytes` and reject a missing `width`.
+  const imageTarget = attachmentStore.reads[0]?.policy
+  check('the request target satisfies the 0.1.2-0.1.5 contract', Number.isSafeInteger(imageTarget?.maxPixels) && imageTarget?.maxPixels > 0, JSON.stringify(imageTarget))
+  check('the request target satisfies the 0.1.6+ contract', Number.isSafeInteger(imageTarget?.width) && imageTarget?.width > 0 && Number.isSafeInteger(imageTarget?.height) && imageTarget?.height > 0, JSON.stringify(imageTarget))
+  check('the projected dimensions respect the pixel budget', imageTarget.width * imageTarget.height <= imageTarget.maxPixels, `${imageTarget.width}x${imageTarget.height} > ${imageTarget.maxPixels}`)
 
   // A text-only call must never touch the attachment service.
   attachmentStore.reads.length = 0
@@ -772,6 +781,25 @@ try {
     unresolvedError = String(error?.message ?? error)
   }
   check('an unresolved image reference is an explicit failure', /could not resolve|cannot read properties/i.test(unresolvedError), unresolvedError)
+
+  // ── request-image geometry ──────────────────────────────────────────────────
+  // The projection must be the harness's own geometry, because the older host
+  // applies exactly this and the newer one takes the value as given: if the two
+  // disagreed, the same image would render at different sizes per host.
+  const small = projectImageDimensions(800, 600, 4194304)
+  check('an image inside the budget is not resized', small.width === 800 && small.height === 600, JSON.stringify(small))
+  const huge = projectImageDimensions(6000, 4000, 4194304)
+  check('an oversized image is projected inside the budget', huge.width * huge.height <= 4194304 && huge.width > 0 && huge.height > 0, JSON.stringify(huge))
+  check('the projection preserves the aspect ratio', Math.abs((huge.width / huge.height) - 1.5) < 0.01, JSON.stringify(huge))
+  const tall = projectImageDimensions(1000, 10000, 1000000)
+  check('a tall image is projected inside the budget too', tall.width * tall.height <= 1000000 && tall.width > 0 && tall.height > 0, JSON.stringify(tall))
+  // A reference without usable dimensions cannot be turned into a target, and
+  // must fail loudly rather than sending `undefined` as a width.
+  let noSizeError = ''
+  try {
+    requestImageTarget({ attachmentId: 'att-x', mediaType: 'image/png', bytes: 4 }, DEFAULT_REQUEST_IMAGE_POLICY)
+  } catch (error) { noSizeError = String(error?.code ?? error?.message ?? error) }
+  check('a reference without dimensions is refused', /UNSUPPORTED_CONTENT/.test(noSizeError), noSizeError)
 
   check('assistant image output is refused, not dropped', (() => {
     try {
