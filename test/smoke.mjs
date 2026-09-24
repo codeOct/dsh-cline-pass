@@ -484,17 +484,71 @@ try {
     exposeCatalog: false,
     historyLimit: 20,
   }
+  /**
+   * A live configuration reference, exactly the protocol DSH uses.
+   *
+   * The host passes `config` as a frozen reference whose `get()` returns the
+   * current snapshot, and commits a write by swapping the value *inside* that
+   * reference. A test that only returned a fresh object per `get()` would hide
+   * the bug this covers: reading the plain launch object looks identical until
+   * the reference is actually updated.
+   */
+  const liveReference = (initial) => {
+    let current = Object.freeze(structuredClone(initial))
+    return Object.freeze({
+      get: () => current,
+      commit: (next) => { current = Object.freeze(structuredClone(next)) },
+    })
+  }
+  const configReference = liveReference(section)
+  /**
+   * The settings service, with the REAL merge semantics.
+   *
+   * `{ ...section, ...patch }` is not what the host does, and using it here hid a
+   * live defect: the host merges plain objects RECURSIVELY and a patch never
+   * carries `undefined`, so a deleted dictionary member cannot be expressed by
+   * `update` — writing the survivors back leaves the deleted key in place. A
+   * shallow stub made the remove-account checks pass while the real delete
+   * button did nothing. `mutate` with an `unset` path op is the host's removal
+   * mechanism and is modelled here too.
+   */
+  const isPlainObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value)
+  const mergeLayers = (under, over) => {
+    if (!isPlainObject(under) || !isPlainObject(over)) return over
+    const merged = { ...under }
+    for (const [key, value] of Object.entries(over)) {
+      merged[key] = Object.hasOwn(merged, key) ? mergeLayers(merged[key], value) : value
+    }
+    return merged
+  }
+  const applyUnset = (target, path) => {
+    const [head, ...rest] = path
+    if (head === undefined) return
+    if (rest.length === 0) {
+      if (isPlainObject(target)) delete target[head]
+      return
+    }
+    if (isPlainObject(target) && isPlainObject(target[head])) applyUnset(target[head], rest)
+  }
   const settingsService = {
-    installSection(_owner, _ns, _schema, entry, hooks) {
-      hooks.setSource(() => section)
-      void entry
-    },
     async update(_ns, patch) {
-      section = { ...section, ...patch }
+      section = mergeLayers(section, patch)
+      configReference.commit(section)
+    },
+    async mutate(_ns, ops) {
+      const next = structuredClone(section)
+      for (const op of ops) {
+        if (op.op !== 'unset') throw new Error(`the test stub only models unset ops, got ${op.op}`)
+        applyUnset(next, op.path)
+      }
+      section = next
+      configReference.commit(section)
     },
   }
   const fakeCtx = {
     logger: { info() {}, warn() {}, error() {} },
+    fiber: { config: configReference },
+    on() {},
     settings: settingsService,
     credentials: {
       async resolve(ref) {
@@ -531,7 +585,200 @@ try {
     },
   }
 
-  apply(fakeCtx, { ...section })
+  const defaultConfigCtx = {
+    logger: { info() {}, warn() {}, error() {} },
+    get() { return undefined },
+    inject() {},
+    llm: {
+      registered: null,
+      registerAdapter(routes, adapter) {
+        this.registered = { routes, adapter }
+        return Object.assign(() => {}, { replace() {} })
+      },
+      registerConfigurableProviders() {
+        return Object.assign(() => {}, { replace() {} })
+      },
+    },
+    tools: {
+      register() { return () => {} },
+    },
+  }
+  let defaultConfigError = null
+  try {
+    apply(defaultConfigCtx, {})
+  } catch (error) {
+    defaultConfigError = error
+  }
+  check('an empty raw configuration activates the default route', defaultConfigError === null, defaultConfigError?.message ?? '')
+  check('an empty raw configuration registers cline-pass', same(defaultConfigCtx.llm.registered?.routes, ['cline-pass']))
+  const defaultProviderInfo = defaultConfigCtx.llm.registered?.adapter?.providerInfo('cline-pass')
+  const defaultModels = await defaultConfigCtx.llm.registered?.adapter?.listModels('cline-pass')
+  check('an empty raw configuration gives the default route a name', defaultProviderInfo?.id === 'cline-pass' && defaultProviderInfo.name === 'Cline Pass', JSON.stringify(defaultProviderInfo))
+  check('an empty raw configuration exposes named default models', defaultModels?.length > 0 && defaultModels.every((model) => typeof model.name === 'string' && model.name.length > 0), JSON.stringify(defaultModels))
+  let reactiveConfigError = null
+  try {
+    apply(defaultConfigCtx, Config({}))
+  } catch (error) {
+    reactiveConfigError = error
+  }
+  check('a reactive configuration snapshot activates the default route', reactiveConfigError === null, reactiveConfigError?.message ?? '')
+
+  const frozenConfig = Object.freeze({
+    knownModels: Object.freeze(['cline-pass/kimi-k3']),
+    hiddenModels: Object.freeze([]),
+    perModel: Object.freeze({
+      'cline-pass/kimi-k3': Object.freeze({ upstreams: Object.freeze(['alibaba']), exclude: Object.freeze([]), pinMode: 'preferred', sort: '' }),
+    }),
+  })
+  const frozenConfigCtx = {
+    ...defaultConfigCtx,
+    llm: {
+      registered: null,
+      registerAdapter(routes, adapter) {
+        this.registered = { routes, adapter }
+        return Object.assign(() => {}, { replace() {} })
+      },
+      registerConfigurableProviders() { return Object.assign(() => {}, { replace() {} }) },
+    },
+  }
+  let frozenConfigError = null
+  try {
+    apply(frozenConfigCtx, frozenConfig)
+  } catch (error) {
+    frozenConfigError = error
+  }
+  check('a frozen alpha settings snapshot activates without mutation', frozenConfigError === null, frozenConfigError?.message ?? '')
+  const frozenModels = await frozenConfigCtx.llm.registered?.adapter?.listModels('cline-pass')
+  check('a frozen alpha settings snapshot retains its model catalog', frozenModels?.length === 1 && frozenModels[0]?.id === 'cline-pass/kimi-k3', JSON.stringify(frozenModels))
+
+  /**
+   * The write path that mattered, for the 0.1.7+ host: a settings write must be
+   * observed by the running plugin.
+   *
+   * Two host generations have to work and neither contract is a superset of the
+   * other. This bridge models the NEWER one — a volatile reference the host
+   * commits into, plus `loader/volatile-update`. `bridgeStableContext` below
+   * models the OLDER one — `installSection`'s `setSource` with a plain
+   * `fiber.config`, which is all stable 0.1.5-rc.3 offers.
+   *
+   * The bug this pair guards: the plugin read its launch snapshot forever, so a
+   * saved pin was persisted and the next request still went out unpinned even
+   * though every write reported success.
+   */
+  const bridgeContext = (initialSection) => {
+    const reference = liveReference(initialSection)
+    const bridge = {
+      logger: { info() {}, warn() {}, error() {} },
+      adapter: null,
+      fiber: { config: reference },
+      settings: {
+        async update(_ns, patch) {
+          const next = { ...reference.get(), ...patch }
+          reference.commit(next)
+        },
+      },
+      get(name) { return this[name] },
+      on() {},
+      inject() { return () => {} },
+      llm: {
+        registerAdapter(_routes, adapter) {
+          bridge.adapter = adapter
+          return Object.assign(() => {}, { replace() {} })
+        },
+        registerConfigurableProviders() { return Object.assign(() => {}, { replace() {} }) },
+      },
+      tools: { register() { return () => {} } },
+    }
+    return bridge
+  }
+
+  const liveBridge = bridgeContext({ knownModels: ['cline-pass/kimi-k3'], hiddenModels: [] })
+  apply(liveBridge, liveBridge.fiber.config)
+  check('the plugin activates against a volatile configuration reference', liveBridge.adapter !== null)
+  const visibleBefore = await liveBridge.adapter.listModels('cline-pass')
+  check('a volatile configuration reference reads its initial models', visibleBefore.length === 1, JSON.stringify(visibleBefore))
+  // The host commits the change into the same reference, which is what a
+  // settings write does; the adapter must observe it with no re-registration.
+  await liveBridge.settings.update('cline-pass', { hiddenModels: ['cline-pass/kimi-k3'] })
+  const hiddenAfter = await liveBridge.adapter.listModels('cline-pass')
+  check('a settings write reaches the live model list through the reference', hiddenAfter.length === 0, JSON.stringify(hiddenAfter))
+
+  // The whole-object `.volatile()` schema leaves direct properties undefined, so
+  // a value read as `config.field` rather than `config.get().field` silently
+  // degrades to the schema default. This asserts the live reference is honored
+  // for a scalar that only the reference carries.
+  const scalarReference = liveReference({ knownModels: ['cline-pass/kimi-k3'], displayName: 'From reference' })
+  const scalarBridge = bridgeContext({})
+  scalarBridge.fiber = { config: scalarReference }
+  apply(scalarBridge, scalarReference)
+  const scalarInfo = scalarBridge.adapter.providerInfo('cline-pass')
+  check('a scalar read uses the live reference, not the launch snapshot', scalarInfo?.name === 'From reference', JSON.stringify(scalarInfo))
+
+  /**
+   * The STABLE host contract: `installSection` is the only live channel.
+   *
+   * Stable 0.1.5-rc.3 ships a settings service with `installSection` and a
+   * `fiber.config` that is a plain resolved object with NO `.get()`, and its
+   * loader has no `loader/volatile-update` event at all. So `setSource` is the
+   * only way a saved value can ever reach the route on that line — the plugin
+   * must keep registering it, and must read whatever that callback supplies.
+   */
+  const stableBridge = (initialSection) => {
+    let current = { ...initialSection }
+    const bridge = {
+      logger: { info() {}, warn() {}, error() {} },
+      adapter: null,
+      // A plain object, exactly as the stable Fiber exposes it: no `.get()`.
+      fiber: { config: current },
+      installedSource: undefined,
+      settings: {
+        installSection(_owner, _ns, _schema, _entry, hooks) {
+          bridge.installedSource = hooks
+          hooks.setSource(() => current)
+        },
+        async update(_ns, patch) {
+          current = { ...current, ...patch }
+          // The host re-publishes through the registered source.
+          bridge.installedSource?.setSource(() => current)
+          bridge.installedSource?.onChange()
+        },
+      },
+      get(name) { return this[name] },
+      on() {},
+      inject(names, callback) {
+        if (names.includes('settings')) callback(bridge)
+        return () => {}
+      },
+      llm: {
+        registerAdapter(_routes, adapter) {
+          bridge.adapter = adapter
+          return Object.assign(() => {}, { replace() {} })
+        },
+        registerConfigurableProviders() { return Object.assign(() => {}, { replace() {} }) },
+      },
+      tools: { register() { return () => {} } },
+    }
+    return bridge
+  }
+
+  const plainStable = stableBridge({ knownModels: ['cline-pass/kimi-k3'], hiddenModels: [] })
+  apply(plainStable, { knownModels: ['cline-pass/kimi-k3'], hiddenModels: [] })
+  check('the plugin registers a settings section on a stable-style host', plainStable.installedSource !== undefined)
+  const stableVisible = await plainStable.adapter.listModels('cline-pass')
+  check('a plain (non-volatile) configuration activates on stable', stableVisible.length === 1, JSON.stringify(stableVisible))
+  await plainStable.settings.update('cline-pass', { hiddenModels: ['cline-pass/kimi-k3'] })
+  const stableHidden = await plainStable.adapter.listModels('cline-pass')
+  check('a settings write reaches the live model list through installSection', stableHidden.length === 0, JSON.stringify(stableHidden))
+
+  // The schema itself must survive a host whose Schemastery has no `.volatile`:
+  // calling it there throws at module scope and the plugin never imports.
+  const { Config: ExportedConfig } = await import('../lib/index.js')
+  check('the exported Config schema builds without volatile support', ExportedConfig !== undefined)
+  const parsedDefaults = ExportedConfig({ knownModels: ['cline-pass/kimi-k3'] })
+  const defaulted = typeof parsedDefaults?.get === 'function' ? parsedDefaults.get() : parsedDefaults
+  check('the schema defaulted a plain object without `.get()` on the result', defaulted?.provider === 'cline-pass' && defaulted?.historyLimit > 0, JSON.stringify(defaulted))
+
+  apply(fakeCtx, configReference)
   await new Promise((resolve) => setTimeout(resolve, 10))
 
   // The panel drives the same engine and control surface the tools use, so it
@@ -542,7 +789,12 @@ try {
     settingsAvailable: () => true,
     routeRegistered: () => true,
     readConfig: () => section,
-    updateConfig: async (patch) => { section = { ...section, ...patch } },
+    updateConfig: async (patch) => { section = mergeLayers(section, patch) },
+    removeConfigKeys: async (namespace, keys) => {
+      const next = structuredClone(section)
+      for (const key of keys) applyUnset(next, [namespace, key])
+      section = next
+    },
     accounts: () => accountProfilesOf(section),
     accountsWithKeys: async () => await Promise.all(accountProfilesOf(section).map(async (account) => {
       const value = credentials.get(String(account.apiKeyEnv))
@@ -684,6 +936,10 @@ try {
   check('account test authorizes a working key', tested2.note.includes('authorized'), tested2.note)
   const removed = await call('cline_pass_accounts', { action: 'remove', name: 'backup' })
   check('remove drops the account', removed.accounts.length === 1 && section.accounts.backup === undefined)
+  // The dictionary itself must no longer carry the key. `accounts.length` alone
+  // could pass on a projection that filters, while the stored section still held
+  // the removed member — which is exactly how the delete button looked broken.
+  check('remove deletes the key from the stored dictionary', !Object.hasOwn(section.accounts ?? {}, 'backup'), JSON.stringify(section.accounts))
   let removeMissing = ''
   try {
     await call('cline_pass_accounts', { action: 'remove', name: 'nope' })
@@ -928,6 +1184,7 @@ try {
   check('account.mode switches the pool', panelMode.accountMode === 'roundrobin' && section.accountMode === 'roundrobin')
   const panelRemoved = await panel['account.remove']({ name: 'panel' })
   check('account.remove drops the account', panelRemoved.accounts.every((account) => account.key !== 'panel'))
+  check('account.remove deletes the key from the stored dictionary', !Object.hasOwn(section.accounts ?? {}, 'panel'), JSON.stringify(section.accounts))
   await panel['account.mode']({ mode: 'single' })
 
   const panelPinned = await panel['model.pin']({ model: 'cline-pass/glm-5.2', upstreams: ['alibaba', 'baseten'], pinMode: 'preferred', sort: 'ttft' })
@@ -946,10 +1203,13 @@ try {
   // one is pinned alone; with every channel refusing, the probe itself reports
   // the failure and nothing is pinned at all.
   stub.broken = ['baseten']
+  const autoStart = stub.requests.length
   const auto = await panel['setup.auto']({ model: 'cline-pass/glm-5.2' })
+  const autoRequests = stub.requests.slice(autoStart)
   check('setup.auto pins only the channels that answered', auto.ok === true && same(auto.pinned, ['alibaba']), JSON.stringify(auto))
   check('setup.auto excludes the channel that refused', same(auto.excluded, ['baseten']), JSON.stringify(auto.excluded))
   check('setup.auto verified the pin with a real call', auto.verified === true && auto.actual === 'alibaba', JSON.stringify(auto))
+  check('setup.auto reuses strict validation instead of issuing a duplicate test', autoRequests.length === 5, String(autoRequests.length))
   check('setup.auto persisted a preferred pin', section.perModel['cline-pass/glm-5.2'].pinMode === 'preferred', JSON.stringify(section.perModel['cline-pass/glm-5.2']))
   stub.broken = ['alibaba', 'baseten']
   const autoFailed = await panel['setup.auto']({ model: 'cline-pass/glm-5.2' })
@@ -1026,6 +1286,23 @@ try {
 
   const rpcOk = await post('state', {})
   check('a known action answers 200 with ok/value', rpcOk.status === 200 && rpcOk.json.ok === true && rpcOk.json.value.provider === 'cline-pass', JSON.stringify(rpcOk.json).slice(0, 120))
+  const originalPanelProbe = panelEngine.probe
+  let forwardedSignal = null
+  panelEngine.probe = async (_model, options) => {
+    forwardedSignal = options?.signal
+    return { ok: false, model: 'cline-pass/glm-5.2', error: 'cancelled' }
+  }
+  try {
+    const signalRequest = new Request(`http://localhost${PANEL_PATH}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ endpoint: 'model.probe', payload: { model: 'cline-pass/glm-5.2' } }),
+    })
+    await route.fetch(signalRequest)
+    check('the panel route forwards its request signal to diagnostics', forwardedSignal === signalRequest.signal)
+  } finally {
+    panelEngine.probe = originalPanelProbe
+  }
   const rpcUnknown = await post('nope', {})
   check('an unknown action is a typed failure, not a throw', rpcUnknown.json.ok === false && rpcUnknown.json.error.code === PANEL_ERROR_CODE, JSON.stringify(rpcUnknown))
   const rpcBadArgs = await post('model.pin', {})
