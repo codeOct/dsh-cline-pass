@@ -444,6 +444,47 @@ for (const name of ['refresh', 'setKey', 'testKey', 'saveAndTest', 'addAccount',
   check(`the injected face exposes ${name}`, typeof firstFace[name] === 'function')
 }
 
+// The browser controls must do more than exist: each click has to post the
+// matching panel endpoint and accept the host's returned state. This stub is a
+// local panel response only; no subscription request is made by the test.
+const clickCalls = []
+const clickableModel = 'cline-pass/kimi-k3'
+const clickableState = {
+  provider: 'cline-pass', displayName: 'Cline Pass', baseURL: 'https://api.cline.bot/api/v1', settingsAvailable: true,
+  accountMode: 'single', activeAccount: '', ready: true,
+  accounts: [{ key: 'default', displayName: 'Cline Pass', apiKeyEnv: 'CLINE_PASS_API_KEY', enabled: true, keyConfigured: true, keyHint: 'sk_liv…3456' }],
+  models: [{ id: clickableModel, displayName: 'kimi-k3', hidden: false, pinned: [], excluded: [], upstreams: ['alibaba'], upstreamStatus: [], pinMode: 'preferred', sort: '', pipeline: 'planner', pinnable: true, lastProvider: '', lastMs: 0, probedAt: 0, validatedAt: 0 }],
+  pinnedModels: 0, hiddenModels: 0, usage: {}, usageWindows: {}, plan: {}, catalogCount: 1, historySize: 0,
+}
+const originalFetch = globalThis.fetch
+globalThis.fetch = async (path, init) => {
+  const request = JSON.parse(String(init?.body ?? '{}'))
+  clickCalls.push({ path, endpoint: request.endpoint, payload: request.payload, hasSignal: init?.signal !== undefined })
+  let value = clickableState
+  if (request.endpoint === 'model.probe') value = { model: clickableModel, result: { ok: true, pipeline: 'planner', upstreams: ['alibaba'], error: '' } }
+  if (request.endpoint === 'model.validate') value = { ...clickableState, model: clickableModel, results: [{ upstream: 'alibaba', status: 'ok', ms: 1, note: '' }], summary: { ok: 1, limited: 0, bad: 0, auth: 0, unknown: 0 } }
+  if (request.endpoint === 'model.test') value = { model: clickableModel, ok: true, actual: 'alibaba', ms: 1, error: '', attempts: [] }
+  if (request.endpoint === 'setup.auto') value = { model: clickableModel, ok: true, pinned: ['alibaba'], excluded: [], actual: 'alibaba', error: '' }
+  return new Response(JSON.stringify({ ok: true, value }), { headers: { 'content-type': 'application/json' } })
+}
+try {
+  await firstFace.setModelsVisibility('invert')
+  await firstFace.setModelVisible(clickableModel, false)
+  await firstFace.pinModel({ model: clickableModel, upstreams: ['alibaba'] })
+  await firstFace.probeModel(clickableModel)
+  await firstFace.validateModel(clickableModel)
+  await firstFace.testModel(clickableModel, ['alibaba'])
+  await firstFace.resetModel(clickableModel)
+  await firstFace.setupModel(clickableModel)
+} finally {
+  globalThis.fetch = originalFetch
+}
+for (const endpoint of ['models.visibility', 'model.visibility', 'model.pin', 'model.probe', 'model.validate', 'model.test', 'setup.auto']) {
+  check(`the model control posts ${endpoint}`, clickCalls.some((call) => call.path === PANEL_PATH && call.endpoint === endpoint), JSON.stringify(clickCalls))
+}
+check('a clicked channel pin preserves its model and channel', clickCalls.some((call) => call.endpoint === 'model.pin' && call.payload?.model === clickableModel && call.payload?.upstreams?.includes('alibaba')), JSON.stringify(clickCalls))
+check('every clicked model control carries an abortable request signal', clickCalls.every((call) => call.hasSignal === true), JSON.stringify(clickCalls))
+
 // ── the manifest and the bundle agree ───────────────────────────────────────
 
 const decl = pkg.dsh?.client
