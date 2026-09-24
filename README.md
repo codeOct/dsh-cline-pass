@@ -13,9 +13,19 @@
 
 ## 要求
 
-- dsh `>= 0.1.2-alpha.3`
+- dsh `>= 0.1.2-alpha.3 < 0.2.0`
 - Node.js `>= 20.3`
 - Cline Pass API Key
+
+插件同时兼容 dsh 稳定线与 alpha 线，两者在配置机制上并不相同，插件会自行探测：
+
+| | 稳定线（`0.1.5-rc.3`） | alpha 线（`0.1.7+`） |
+| --- | --- | --- |
+| 实时配置来源 | `settings.installSection` 的 `setSource` | `config.get()` 的 volatile 引用 |
+| `loader/volatile-update` | 无 | 有 |
+| `Schema.prototype.volatile` | 无 | 有 |
+
+因此保存的钉住、隐藏模型、账号改动在两条线上都能立刻生效，无需重启。
 
 ## 安装
 
@@ -51,7 +61,14 @@ dsh --profile web
 cline_pass_accounts action=add name=main key=sk_xxx
 cline_pass_accounts action=add name=backup key=sk_yyy
 cline_pass_accounts action=mode mode=roundrobin
+cline_pass_accounts action=remove name=backup
 ```
+
+删除账号只移除账号本身，其凭据仍留在凭据库中，便于日后恢复。
+
+多账号时，额度卡片上方会出现账号标签，**点击标签切换查看对应账号的额度**（一次只显示一个账号，避免多个账号的窗口堆在一起难以阅读）。切换查看不会写入配置。
+
+> 面板点击删除账号时，插件使用主机的路径删除操作（`mutate` + `unset`）而不是普通写入。这是因为 `settings.update` 对普通对象是递归合并，缺失的键会保留，普通写入无法真正删除账号。
 
 ### 配置文件
 
@@ -100,9 +117,17 @@ cline_pass_pin      model=cline-pass/glm-5.2 upstreams=["alibaba","baseten"] pin
 ## 开发
 
 ```bash
-npm test
-npm run test:client
-npm run test:mount
+npm test                  # 全部离线回归（含真实挂载与账号删除）
+npm run test:client       # 面板客户端
+npm run test:protocol     # 线上协议与 pin 判定
+npm run test:accounts     # 账号删除（真实 settings 语义）
+npm run test:mount        # 在 alpha 真实插件树上挂载
+```
+
+兼容稳定线需要单独验证（该测试要求一个已安装的稳定版 dsh）：
+
+```bash
+node test/mount-stable.mjs --stable-dir <.../@deepseek-ai/dsh>
 ```
 
 访问真实网关的测试还包括：

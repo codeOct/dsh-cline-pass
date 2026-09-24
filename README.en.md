@@ -17,6 +17,18 @@ Connect [Cline Pass](https://cline.bot/cline-pass) subscription models to the [D
 - Node.js `>= 20.3`
 - A Cline Pass API key
 
+The plugin supports both the stable and the alpha dsh lines, whose configuration
+mechanisms differ; the plugin probes for what the host offers:
+
+| | Stable (`0.1.5-rc.3`) | Alpha (`0.1.7+`) |
+| --- | --- | --- |
+| Live configuration source | `settings.installSection`'s `setSource` | the volatile reference from `config.get()` |
+| `loader/volatile-update` | absent | present |
+| `Schema.prototype.volatile` | absent | present |
+
+Saved pins, hidden models and account edits therefore take effect on both lines
+without a restart.
+
 ## Install
 
 ```bash
@@ -51,7 +63,21 @@ Add accounts in the settings panel and select single-account or round-robin mode
 cline_pass_accounts action=add name=main key=sk_xxx
 cline_pass_accounts action=add name=backup key=sk_yyy
 cline_pass_accounts action=mode mode=roundrobin
+cline_pass_accounts action=remove name=backup
 ```
+
+Removing an account removes only the account; its stored credential stays in the
+credential store so it can be restored later.
+
+With more than one account, a strip of account tabs appears above the quota card.
+**Click a tab to switch which account's quota is shown** — one account at a time,
+so several accounts' windows do not pile up into an unreadable column. Switching
+the view never writes to the configuration.
+
+> The panel deletes an account through the host's path-removal operation
+> (`mutate` + `unset`) rather than an ordinary write, because `settings.update`
+> merges plain objects recursively and a missing key is therefore preserved —
+> an ordinary write cannot delete an account at all.
 
 ### Configuration file
 
@@ -100,9 +126,17 @@ cline_pass_pin      model=cline-pass/glm-5.2 upstreams=["alibaba","baseten"] pin
 ## Development
 
 ```bash
-npm test
-npm run test:client
-npm run test:mount
+npm test                  # the full offline suite (real mounts and account removal included)
+npm run test:client       # the panel's browser half
+npm run test:protocol     # wire protocol and pin verdicts
+npm run test:accounts     # account removal, with the host's real settings semantics
+npm run test:mount        # mount on a real alpha plugin tree
+```
+
+Stable-line compatibility is verified separately (it needs an installed stable dsh):
+
+```bash
+node test/mount-stable.mjs --stable-dir <.../@deepseek-ai/dsh>
 ```
 
 Live gateway checks are also available:
