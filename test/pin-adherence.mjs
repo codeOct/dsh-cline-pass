@@ -20,6 +20,7 @@ import {
   MAX_UPSTREAMS,
   mergeUpstreams,
   normalizePinMode,
+  parseRouting,
   pinAdherence,
   pinWarnings,
 } from '../lib/protocol.js'
@@ -55,6 +56,73 @@ const detectedDirect = injectPrefs({ model: 'm' }, { pipeline: 'direct', upstrea
 check("spelling 'detected' emits nothing for the other pipeline", detectedDirect.providerOptions === undefined && same(detectedDirect.provider.only, ['a']), JSON.stringify(detectedDirect))
 
 check('a body with no pin and no exclusion is still left untouched', same(injectPrefs({ model: 'm' }, {}, {}), { model: 'm' }))
+
+// ── where the routing metadata lives, buffered AND streamed ──────────────────
+//
+// The gateway hangs `provider_metadata.gateway.routing` off a different key
+// depending on how the answer was requested: `choices[0].message` for a buffered
+// answer, `choices[0].delta` for a stream frame. Reading only `message` meant
+// every streamed call — which is every real conversation — looked metadata-free,
+// so the adapter fell back to the channel the pin had *asked* for. The history
+// then reported the configured channel and a strict pin the router ignored was
+// indistinguishable from one it honored.
+//
+// These payloads are trimmed copies of real gateway frames captured from
+// `https://api.cline.bot/api/v1` (a `baseten`-pinned request that `deepseek`
+// actually served).
+
+const routingFrame = (where) => ({
+  choices: [{
+    [where]: {
+      provider_metadata: {
+        gateway: {
+          routing: {
+            finalProvider: 'deepseek',
+            canonicalSlug: 'deepseek/deepseek-v4.1-flash',
+            fallbacksAvailable: ['alibaba', 'baseten', 'deepseek'],
+            planningReasoning: 'deepseek won tier 0 over alibaba and baseten',
+          },
+        },
+      },
+    },
+  }],
+})
+
+const bufferedParse = parseRouting(routingFrame('message'))
+check('a buffered answer reports its serving channel', bufferedParse.finalProvider === 'deepseek', JSON.stringify(bufferedParse))
+check('a buffered answer reports its pipeline', bufferedParse.pipeline === 'planner', JSON.stringify(bufferedParse))
+check('a buffered answer reports its fallback list', same(bufferedParse.fallbacks, ['alibaba', 'baseten', 'deepseek']), JSON.stringify(bufferedParse.fallbacks))
+
+const streamedParse = parseRouting(routingFrame('delta'))
+check('a STREAM frame reports its serving channel', streamedParse.finalProvider === 'deepseek', JSON.stringify(streamedParse))
+check('a STREAM frame reports its pipeline', streamedParse.pipeline === 'planner', JSON.stringify(streamedParse))
+check('a STREAM frame reports its fallback list', same(streamedParse.fallbacks, ['alibaba', 'baseten', 'deepseek']), JSON.stringify(streamedParse.fallbacks))
+check('a STREAM frame reports the canonical slug', streamedParse.canonicalSlug === 'deepseek/deepseek-v4.1-flash', JSON.stringify(streamedParse))
+
+// The pin asked for baseten; the metadata says deepseek. Adherence must read
+// "not-adopted", which is what turns a silently ignored pin into a visible fact.
+check(
+  'a streamed answer that ignored a strict pin is reported as not-adopted',
+  pinAdherence({ upstream: 'baseten', strict: true }, { finalProvider: streamedParse.finalProvider }) === 'not-adopted',
+  pinAdherence({ upstream: 'baseten', strict: true }, { finalProvider: streamedParse.finalProvider }),
+)
+
+// A plain content frame must stay metadata-free rather than inventing a channel.
+const contentOnly = parseRouting({ choices: [{ delta: { content: 'OK' } }] })
+check('a content-only stream frame reports no serving channel', contentOnly.finalProvider === null && contentOnly.pipeline === null, JSON.stringify(contentOnly))
+
+// The direct pipeline names its provider at the top level, in both shapes.
+// `slugify` lowercases and hyphenates whitespace only, so "Z.AI" becomes "z.ai"
+// here; translating that into the pipeline's own vocabulary is
+// `channelNameFor`'s job, not this parser's.
+const directFrame = parseRouting({ provider: 'Z.AI', choices: [{ delta: { content: 'OK' } }] })
+check('a direct-pipeline frame still reads the top-level provider', directFrame.finalProvider === 'z.ai' && directFrame.pipeline === 'direct', JSON.stringify(directFrame))
+check('a direct-pipeline frame keeps the display name', directFrame.finalProviderName === 'Z.AI', JSON.stringify(directFrame))
+check('a direct name is translated into the planner spelling where needed', channelNameFor(directFrame.finalProvider, 'planner') === 'zai', channelNameFor(directFrame.finalProvider, 'planner'))
+
+// The search must not break the older top-level shape either.
+const topLevel = parseRouting({ provider_metadata: { gateway: { routing: { finalProvider: 'baseten' } } }, choices: [{ message: { content: 'OK' } }] })
+check('a bare top-level routing object is still accepted', topLevel.finalProvider === 'baseten', JSON.stringify(topLevel))
 
 // ── per-pipeline channel lists ───────────────────────────────────────────────
 
