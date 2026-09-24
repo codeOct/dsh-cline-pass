@@ -20,15 +20,27 @@
 
 import { createServer } from 'node:http'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { createRequire } from 'node:module'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { boot, loadOptionalPatches } from '@deepseek-ai/dsh-app-boot'
+import { boot, readProfilePatches } from '@deepseek-ai/dsh-app-boot'
 import { PANEL_PATH } from '../lib/panel.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const pluginDir = resolve(here, '..')
-const installAnchor = '/usr/lib/node_modules/@deepseek-ai/dsh/package.json'
-const installScope = '/usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai'
+/**
+ * The real installation this test composes against.
+ *
+ * The anchors used to be hard-coded POSIX paths, so the whole test aborted on
+ * this host before it could mount anything — and a settings row named
+ * `dsh-settings-file`, which no release has ever shipped, made the tree fail to
+ * activate even where the paths existed. Both are resolved from the running CLI
+ * now, and the settings row is the one the base bundle actually mounts.
+ */
+const cliRequire = createRequire(import.meta.url)
+const cliRoot = dirname(cliRequire.resolve('@deepseek-ai/dsh/package.json'))
+const installAnchor = join(cliRoot, 'package.json')
+const installScope = join(cliRoot, 'node_modules', '@deepseek-ai')
 
 let passed = 0
 const failures = []
@@ -63,26 +75,57 @@ const baseURL = `http://127.0.0.1:${gateway.address().port}/api/v1`
 
 const profileDir = mkdtempSync(join(here, '.mount-'))
 const scratch = join(profileDir, 'scratch')
+// A separate Harness home, as a launched profile has: `$DSH_HOME` sits above
+// `profiles/<name>`, so the profile patch and the home patch are never one file.
+const homeDir = join(profileDir, 'home')
 mkdirSync(scratch, { recursive: true })
+mkdirSync(homeDir, { recursive: true })
 mkdirSync(join(profileDir, 'node_modules'), { recursive: true })
 symlinkSync(installScope, join(profileDir, 'node_modules', '@deepseek-ai'), 'dir')
 
-writeFileSync(join(profileDir, 'package.json'), JSON.stringify({ name: 'dsh-profile-mount-test', private: true, dsh: { profile: { bundles: [] } } }, null, 2))
-writeFileSync(join(profileDir, 'cordis.yml'), '# composed entirely from the patch file\n[]\n')
-writeFileSync(join(profileDir, 'cordis.patch.yml'), `# The host rows this plugin needs, then the plugin itself.
+/**
+ * A local bundle, laid out exactly like a shipped one.
+ *
+ * Rows have to be created by a *bundle* layer; the profile's own patch file can
+ * only address rows that already exist. Putting the rows in `cordis.patch.yml`
+ * made the whole tree land inside the root `include` entry, and putting them in
+ * one `insert:` group there made every settings write fail as "overridden by a
+ * home patch". The shipped Web profile splits the two the same way this does:
+ * the bundle inserts the row, the user patch overrides its config.
+ */
+const bundleDir = join(profileDir, 'mount-bundle')
+mkdirSync(bundleDir, { recursive: true })
+writeFileSync(join(bundleDir, 'package.json'), JSON.stringify({
+  name: 'mount-bundle',
+  version: '1.0.0',
+  private: true,
+  dsh: { bundle: { patch: './cordis.patch.yml' } },
+}, null, 2))
+// A bundle is resolved from the profile's own `node_modules` (the installation
+// anchor has no such package), so the local bundle is linked in like an
+// installed dependency rather than merely written next to the profile.
+symlinkSync(bundleDir, join(profileDir, 'node_modules', 'mount-bundle'), 'dir')
+
+writeFileSync(join(profileDir, 'package.json'), JSON.stringify({
+  name: 'dsh-profile-mount-test',
+  private: true,
+  dsh: { profile: { bundles: ['mount-bundle'] } },
+}, null, 2))
+writeFileSync(join(profileDir, 'cordis.yml'), '# composed entirely from the bundle and patch files\n[]\n')
+
+writeFileSync(join(bundleDir, 'cordis.patch.yml'), `# The host rows this plugin needs, then the plugin itself.
 - insert:
     - id: llm
       name: '@deepseek-ai/dsh-llm'
 
+    - id: config-editor
+      name: '@deepseek-ai/dsh-config-editor'
+
     - id: settings
-      name: '@deepseek-ai/dsh-settings-file'
-      config:
-        path: ${JSON.stringify(join(scratch, 'settings.yaml'))}
+      name: '@deepseek-ai/dsh-settings'
 
     - id: credentials
       name: '@deepseek-ai/dsh-credentials-local'
-      config:
-        path: ${JSON.stringify(join(scratch, 'credentials.yaml'))}
 
     - id: system-prompt
       name: '@deepseek-ai/dsh-system-prompt'
@@ -92,9 +135,6 @@ writeFileSync(join(profileDir, 'cordis.patch.yml'), `# The host rows this plugin
 
     - id: webserver
       name: '@deepseek-ai/dsh-host-webserver'
-      config:
-        host: 127.0.0.1
-        port: 0
 
     - id: connection
       name: '@deepseek-ai/dsh-client-connection'
@@ -104,23 +144,72 @@ writeFileSync(join(profileDir, 'cordis.patch.yml'), `# The host rows this plugin
 
     - id: cline-pass
       name: ${JSON.stringify(join(pluginDir, 'lib/index.js'))}
-      config:
-        baseURL: ${JSON.stringify(baseURL)}
-        apiKeyEnv: MOUNT_TEST_API_KEY
-        knownModels:
-          - cline-pass/glm-5.2
-          - cline-pass/kimi-k3
+`)
+
+// The user layer: the same overrides a profile owner would write. The settings
+// editor merges a write into this file, and `inheritedConfig` reads the rows
+// beneath it, so both halves of the write path are exercised for real.
+writeFileSync(join(profileDir, 'cordis.patch.yml'), `# Profile-owned overrides, addressed at rows the bundle inserted.
+- id: credentials
+  config:
+    path: ${JSON.stringify(join(scratch, 'credentials.yaml'))}
+
+- id: webserver
+  config:
+    host: 127.0.0.1
+    port: 0
+
+- id: cline-pass
+  config:
+    baseURL: ${JSON.stringify(baseURL)}
+    apiKeyEnv: MOUNT_TEST_API_KEY
+    knownModels:
+      - cline-pass/glm-5.2
+      - cline-pass/kimi-k3
 `)
 
 process.env.MOUNT_TEST_API_KEY = 'sk_mount_test_key'
+
+/**
+ * The profile facts the real Settings service reads.
+ *
+ * `dsh-settings` and `dsh-config-editor` both `inject: ['profileContext']`, and
+ * the editor persists a write into `profileContext.patchPath` — so a tree that
+ * omits this provides no settings service at all, and every panel write fails
+ * with "settings unavailable" instead of exercising the real document. The
+ * context is the same shape the CLI launcher supplies.
+ */
+const profileContext = {
+  name: 'mount-test',
+  dir: profileDir,
+  patchPath: join(profileDir, 'cordis.patch.yml'),
+  installAnchor,
+  cwd: profileDir,
+  // The Harness home is deliberately a DIFFERENT directory from the profile,
+  // matching a real installation (`$DSH_HOME` above `profiles/<name>`). Point
+  // both at one directory and the launch patches read the same file twice — once
+  // as the profile layer and once as the home layer — so the editor rejects the
+  // write it is about to make as "overridden by a home patch or command-line
+  // overlay", even though nothing outside this file disagrees with it.
+  home: homeDir,
+  startedBundles: ['mount-bundle'],
+  overlays: [],
+  telemetryDisabledEnv: undefined,
+}
 
 // ── mount ───────────────────────────────────────────────────────────────────
 
 let ctx
 try {
-  const patches = loadOptionalPatches('dsh', join(profileDir, 'cordis.patch.yml')) ?? []
-  check('the patch file composes', patches.length > 0, JSON.stringify(patches))
-  ctx = await boot('dsh', join(profileDir, 'cordis.yml'), patches)
+  // Compose the launch patches exactly the way the CLI launcher does — bundle
+  // layers first, then the profile's own patch file — instead of reading only
+  // the user layer. That ordering is what puts the rows in the tree under the
+  // ids the config editor addresses.
+  const patches = readProfilePatches('dsh', profileContext)
+  check('the profile composes from its bundle and patch layers', patches.length > 0, JSON.stringify(patches))
+  ctx = await boot('dsh', join(profileDir, 'cordis.yml'), patches, (hostCtx) => {
+    hostCtx.provide('profileContext', profileContext)
+  })
   check('the tree mounted with every row activated', true)
 
   const entries = [...ctx.loader.entries()].map((entry) => entry.options?.id ?? entry.options?.name)
@@ -174,7 +263,10 @@ try {
   check('the stream finishes', chunks.at(-1)?.type === 'finish', JSON.stringify(chunks.at(-1)))
   check('the stub received the call with usage requested', received.length === 1 && received[0].stream === true && received[0].stream_options?.include_usage === true, JSON.stringify(received))
 
-  // A pin written through the settings document must reach the next request.
+  // A pin written through the settings service must reach the next request
+  // without a restart. This is the regression that mattered: the write used to
+  // land in the document while the plugin kept reading its launch snapshot, so
+  // this call went out unpinned and the field below was `null`.
   const settings = ctx.get('settings')
   await settings.update('cline-pass', { perModel: { 'cline-pass/glm-5.2': { upstreams: ['baseten'], exclude: [], pinMode: 'strict', sort: '' } } })
   const pinnedChunks = []
@@ -272,7 +364,21 @@ try {
   check('the panel state confirms the configured key', stateResponse.json?.value?.ready === true, JSON.stringify(stateResponse.json?.value?.ready))
 
   const pinResponse = await panelPost(envelope('model.pin', { model: 'cline-pass/kimi-k3', upstreams: ['gmicloud'], pinMode: 'preferred', sort: 'ttft' }), cookie)
-  check('a panel write reaches the settings document', pinResponse.status === 200 && JSON.stringify(settings.get('cline-pass')?.perModel?.['cline-pass/kimi-k3']?.upstreams) === JSON.stringify(['gmicloud']), JSON.stringify(settings.get('cline-pass')?.perModel))
+  check('a panel write reaches the settings document', pinResponse.status === 200 && JSON.stringify(pinResponse.json?.value?.models?.find((model) => model.id === 'cline-pass/kimi-k3')?.pinned) === JSON.stringify(['gmicloud']), JSON.stringify(pinResponse.json?.value?.models?.find((model) => model.id === 'cline-pass/kimi-k3')))
+  // The document alone is not the contract: a write that is persisted but never
+  // read is exactly what "the buttons do nothing" looked like, so the same
+  // pinned model is called and the pin is asserted on the request that leaves
+  // the process.
+  const pinnedStream = []
+  try {
+    for await (const chunk of llm.stream({ provider: 'cline-pass', model: 'cline-pass/kimi-k3', messages: [userMessage('pinned?')] })) pinnedStream.push(chunk)
+  } catch { /* a refusal is reported through the request body below */ }
+  // `preferred` pinning is expressed as `gateway.order` (try these in turn),
+  // while a `strict` pin is `gateway.only` (this one or fail), so both
+  // spellings count as the pin having been carried.
+  const sentPin = received.at(-1)?.providerOptions?.gateway ?? received.at(-1)?.provider ?? null
+  check('a panel pin reaches the next request the route sends', JSON.stringify(sentPin?.only ?? sentPin?.order ?? null) === JSON.stringify(['gmicloud']), JSON.stringify(sentPin))
+  check('the pinned call is served by the pinned channel', pinnedStream.filter((chunk) => chunk.type === 'text-delta').map((chunk) => chunk.text).join('') === 'served by gmicloud', JSON.stringify(pinnedStream.map((chunk) => chunk.type)))
 
   const unknownResponse = await panelPost(envelope('nope'), cookie)
   check('an unknown action is a typed failure over the wire', unknownResponse.status === 200 && unknownResponse.json?.ok === false, `HTTP ${unknownResponse.status} — ${unknownResponse.text.slice(0, 120)}`)

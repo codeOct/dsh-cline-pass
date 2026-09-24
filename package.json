@@ -18,10 +18,12 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test/smoke.mjs && node test/client.mjs && node test/pin-adherence.mjs",
+    "test": "node test/smoke.mjs && node test/latency.mjs && node test/client.mjs && node test/pin-adherence.mjs && node test/account-remove.mjs && node test/mount.mjs",
     "test:protocol": "node test/pin-adherence.mjs",
     "test:client": "node test/client.mjs",
+    "test:accounts": "node test/account-remove.mjs",
     "test:mount": "node test/mount.mjs",
+    "test:mount:stable": "node test/mount-stable.mjs",
     "test:live": "node test/live-efforts.mjs",
     "test:live:image": "node test/live-image.mjs",
     "test:live:reasoning": "node test/live-reasoning.mjs"
