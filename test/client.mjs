@@ -103,8 +103,11 @@ const registered = []
 /** The platform seed words the shell actually provides (see dsh-client-modules). */
 const SEED = ['react', 'react/jsx-runtime', 'react-dom', 'react-dom/client', '@deepseek-ai/cordis', '@deepseek-ai/dsh-client-store', '@deepseek-ai/dsh-client-ui-slots', '@deepseek-ai/dsh-client-ui-primitives', '@deepseek-ai/dsh-client-ui-dockkit']
 
+/** Style tags the bundle injects, so their rules can be asserted — not just counted. */
+const injectedStyles = []
+
 const documentStub = {
-  head: { appendChild() {} },
+  head: { appendChild: (node) => { if (node?.textContent) injectedStyles.push(node.textContent) } },
   createElement: () => ({ dataset: {}, textContent: '', setAttribute() {} }),
   querySelector: () => null,
 }
@@ -211,6 +214,33 @@ try {
 }
 
 check('the bundle requires nothing outside the platform seed', missingRequires.length === 0, missingRequires.join(','))
+
+// ── request-log spacing: the failed row must not widen the table ────────────
+//
+// A failure renders its message in a `colSpan=3` cell. Under `table-layout:auto`
+// an unwrapped colspan cell hands the engine its full one-line width as a
+// min-content demand, and a gateway error is wider than the whole table: the
+// three spanned columns inflate, `width:100%` is broken, and the log scrolls
+// sideways exactly when the history holds failures. The generic
+// `.cp-history-table td` (0,1,1) owns `white-space:nowrap`, so the error rule
+// must out-specify it to be able to wrap — asserting the declaration alone
+// would pass even with a selector the cascade never lets win.
+const bundleCss = injectedStyles.join('\n')
+const errorRule = /([^{}]*\.cp-history-error[^{}]*)\{([^}]*)\}/.exec(bundleCss)
+check('the bundle injects its stylesheet', bundleCss.length > 0, `${injectedStyles.length} style tag(s)`)
+check('the failed-row rule out-specifies the generic cell rule',
+  errorRule !== null && errorRule[1].includes('.cp-history-table') && /td\s*\.cp-history-error/.test(errorRule[1]),
+  errorRule?.[1]?.trim() ?? 'no .cp-history-error rule found')
+check('the failed row may wrap instead of demanding one line',
+  errorRule !== null && /white-space:\s*normal/.test(errorRule[2]),
+  errorRule?.[2]?.trim() ?? '')
+check('the failed row no longer clips its message',
+  errorRule !== null && /overflow:\s*visible/.test(errorRule[2]) && /text-overflow:\s*clip/.test(errorRule[2]),
+  errorRule?.[2]?.trim() ?? '')
+check('the failed row breaks a long unbroken token rather than overflowing',
+  errorRule !== null && /word-break:\s*break-word/.test(errorRule[2]),
+  errorRule?.[2]?.trim() ?? '')
+
 check('the plugin exports apply()', typeof exportsValue?.apply === 'function')
 check('the plugin declares its inject list', Array.isArray(exportsValue?.inject) && exportsValue.inject.length > 0, JSON.stringify(exportsValue?.inject))
 check('the plugin injects slots', exportsValue?.inject?.includes('slots'))
